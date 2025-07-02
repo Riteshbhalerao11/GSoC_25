@@ -5,5 +5,9 @@ EOS_IDX = 2  # End of Sequence
 UNK_IDX = 3  # Unknown Token
 SEP_IDX = 4  # Separator Token
 
+T_IDX = [i for i in range(5,25)]
+
+
 # Special token symbols
-SPECIAL_SYMBOLS = ['<S>', '<PAD>', '</S>', '<UNK>', '<SEP>']
+SPL_TERM_SYMBOLS = [f'<T{i}>' for i in range(20)]
+SPECIAL_SYMBOLS = ['<BOS>', '<PAD>', '<EOS>', '<UNK>', '<SEP>'] + SPL_TERM_SYMBOLS

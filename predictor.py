@@ -9,7 +9,7 @@ from .fn_utils import (
     generate_unique_random_integers,
     get_model
 )
-from .constants import PAD_IDX, BOS_IDX, EOS_IDX
+from .constants import PAD_IDX, BOS_IDX, EOS_IDX, SEP_IDX
 
 
 class Predictor:
@@ -85,7 +85,7 @@ class Predictor:
 
                     ys = torch.cat([ys, next_word], dim=1)      
 
-                    if (next_word == EOS_IDX).all():
+                    if ((next_word == EOS_IDX) | (next_word == SEP_IDX)).all():
                         break
 
         return ys
@@ -110,7 +110,7 @@ class Predictor:
         )
 
         tgt_tokens = self.greedy_decode(
-            src, src_padding_mask, start_symbol=BOS_IDX
+            src, src_padding_mask, start_symbol=test_example[1][0]
         ).flatten()
 
         if raw_tokens:

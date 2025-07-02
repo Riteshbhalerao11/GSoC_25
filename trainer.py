@@ -108,10 +108,9 @@ class Trainer():
         self.dataloaders,self.valid_ds = self._prepare_dataloaders(
             df_train, df_valid, tokenizer, src_vocab, tgt_vocab)
 
-        # Calculate warmup steps and epoch steps
-        self.warmup_steps = int(config.warmup_ratio *
-                                len(self.dataloaders['train']) * config.epochs)
-        self.ep_steps = len(self.dataloaders['train'])
+        self.ep_steps = len(self.dataloaders['train'])  
+        self.total_steps = self.ep_steps * config.epochs
+        self.warmup_steps = int(config.warmup_ratio * self.total_steps)
 
         self.root_dir = config.root_dir
         self.current_epoch = config.curr_epoch
@@ -193,7 +192,11 @@ class Trainer():
             m_warm, c_warm = calculate_line_params(
                 (0, end_lr), (self.warmup_steps, start_lr))
             
-            def lam_warm(step): return (1/start_lr)*(m_warm*step + c_warm)
+            def lam_warm(step):
+                if step >= self.warmup_steps:
+                    return 1.0  
+                return (m_warm * step + c_warm) / start_lr
+            
             warm_scheduler = LambdaLR(self.optimizer, lr_lambda=lam_warm)
 
         else:
@@ -203,10 +206,15 @@ class Trainer():
             lr_scheduler = None
         else:
             m_decay, c_decay = calculate_line_params(
-                (0, start_lr), (self.config.epochs, end_lr))
+                (self.warmup_steps, start_lr), (self.total_steps, end_lr))
 
-            def lam(epoch): return (1/start_lr) * (m_decay*epoch + c_decay)
-            lr_scheduler = LambdaLR(self.optimizer, lr_lambda=lam)
+            def lam_decay(step):
+                step = step + self.warmup_steps
+                if step <= self.warmup_steps:
+                    return 1.0
+                return max(0.0, (m_decay * step + c_decay) / start_lr)
+
+            lr_scheduler = LambdaLR(self.optimizer, lr_lambda=lam_decay)
 
         return warm_scheduler, lr_scheduler
 
@@ -250,7 +258,7 @@ class Trainer():
         state = torch.load(file, map_location=device_name)
         self.model.load_state_dict(state['state_dict'])
         
-        if resume or (epoch != None):
+        if resume or (epoch is not None):
             self.train_loss_list = state['train_loss_list']
             self.valid_loss_list = state['valid_loss_list']
             self.best_val_loss = np.array(self.valid_loss_list).min()
@@ -260,6 +268,10 @@ class Trainer():
                 self.lr_scheduler.load_state_dict(state['decay_scheduler'])
             if state['warm_scheduler'] is not None:
                 self.warm_scheduler.load_state_dict(state['warm_scheduler'])
+            
+            if 'scaler' in state:
+                self.scaler.load_state_dict(state['scaler'])
+            
             self.global_step = state['global_step']
 
             if epoch == None:
@@ -342,23 +354,16 @@ class Trainer():
             grad_norm = torch.cat(grads).norm()
 
             # Learning rate scheduling and logging
-            if self.global_step <= self.warmup_steps:
-                if self.is_master:
-                    self.run.log({
-                        'train/lr': self.optimizer.param_groups[0]['lr'],
-                        'global_step': self.global_step
-                    })
+            if self.global_step < self.warmup_steps:
                 if self.warmup_steps:
                     self.warm_scheduler.step()
-            elif self.is_master and (self.global_step % self.config.log_freq == 0):
-                self.run.log({
-                    'train/lr': self.optimizer.param_groups[0]['lr'],
-                    'global_step': self.global_step
-                })
+            else:
+                if not self.is_constant_lr:
+                    self.lr_scheduler.step()
 
-            # Log additional metrics
             if self.is_master and (self.global_step % self.config.log_freq == 0):
                 self.run.log({
+                    'train/lr': self.optimizer.param_groups[0]['lr'],
                     'train/epoch': self.global_step / self.ep_steps,
                     'train/grad_norm': grad_norm,
                     'global_step': self.global_step
@@ -432,8 +437,9 @@ class Trainer():
             "optimizer": self.optimizer.state_dict(),
             "decay_scheduler": self.lr_scheduler.state_dict() if self.lr_scheduler else None,
             "warm_scheduler": self.warm_scheduler.state_dict() if self.warm_scheduler else None,
+            "scaler": self.scaler.state_dict(),            
             "train_loss_list": self.train_loss_list,
-            "valid_loss_list": self.valid_loss_list,
+            "valid_loss_list": self.valid_loss_list,         
             "global_step": self.global_step
         }, ckp_path)
 
@@ -485,8 +491,8 @@ class Trainer():
             training_loss = self._train_epoch()
             valid_loss = self.evaluate()
 
-            if self.global_step >= self.warmup_steps and not self.is_constant_lr:
-                self.lr_scheduler.step(self.current_epoch)
+            # if self.global_step >= self.warmup_steps and not self.is_constant_lr:
+            #     self.lr_scheduler.step(self.current_epoch)
 
             if self.is_master:
                 self.run.log({
@@ -494,8 +500,8 @@ class Trainer():
                     'global_step': self.global_step
                 })
 
-            self.train_loss_list.append(round(training_loss, 4))
-            self.valid_loss_list.append(round(valid_loss, 4))
+            self.train_loss_list.append(training_loss)
+            self.valid_loss_list.append(valid_loss)
 
             if self.is_master:
                 if valid_loss <= self.best_val_loss:

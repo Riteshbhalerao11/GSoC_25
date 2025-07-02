@@ -59,27 +59,44 @@ class Data(Dataset):
         else:
             if enc_excess_tokens < 0 or dec_excess_tokens < 0:
                 raise ValueError("Sentence is too long")
+            
+        if self.config.is_termwise:
+            src_tensor = torch.cat(
+                [
+                    torch.tensor(src_ids, dtype=torch.int64),
+                    self.pad_token,
+                ],
+                dim=0,
+            )
+            tgt_tensor = torch.cat(
+                [
+                    torch.tensor(tgt_ids, dtype=torch.int64),
+                    self.pad_token,
 
-        src_tensor = torch.cat(
-            [
-                self.bos_token,
-                torch.tensor(src_ids, dtype=torch.int64),
-                self.eos_token,
-                self.pad_token,
-            ],
-            dim=0,
-        )
-        tgt_tensor = torch.cat(
-            [
-                self.bos_token,
-                torch.tensor(tgt_ids, dtype=torch.int64),
-                self.eos_token,
-                self.pad_token,
+                ],
+                dim=0,
+            )
+        else:
+            src_tensor = torch.cat(
+                [
+                    self.bos_token,
+                    torch.tensor(src_ids, dtype=torch.int64),
+                    self.eos_token,
+                    self.pad_token,
+                ],
+                dim=0,
+            )
+            tgt_tensor = torch.cat(
+                [
+                    self.bos_token,
+                    torch.tensor(tgt_ids, dtype=torch.int64),
+                    self.eos_token,
+                    self.pad_token,
 
-            ],
-            dim=0,
-        )
-
+                ],
+                dim=0,
+            )
+            
         return src_tensor, tgt_tensor
 
     @staticmethod

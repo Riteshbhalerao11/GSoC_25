@@ -54,14 +54,14 @@ class Tokenizer:
         vocab_set = set()
         for eqn in tqdm(self.sqamps, desc='Processing target vocab'):
             vocab_set.update(self.tgt_tokenize(eqn))
-        return vocab_set
+        return sorted(vocab_set)
     
     def build_src_vocab(self):
         """Build set of unique tokens for source sequences."""
         vocab_set = set()
         for diag in tqdm(self.amps, desc='Processing source vocab'):
             vocab_set.update(self.src_tokenize(diag))
-        return vocab_set
+        return sorted(vocab_set)
 
     def tgt_replace(self, sqampl):
         """Replace momentum terms."""
@@ -129,10 +129,14 @@ class Tokenizer:
         ampl = self.remove_whitespace(ampl)
         ampl = ampl.replace('\\\\', '\\').replace('\\', r' \ ').replace('%', ' % ')
         ampl = ampl.replace("(*)", " CONJ ")
+        ampl = ampl.replace("(theta_W)", "_theta_W")
 
         for pattern in [self.pattern_underscore_curly, self.pattern_mx]:
             ampl = pattern.sub(lambda match: f' {match.group(0)} ', ampl)
-
+        
+        for symbol in self.special_symbols:
+            ampl = ampl.replace(symbol, f" {symbol} ")
+        
         for symbol in ['/', '+', '-', '*', ',', '^', '%', '}', '(', ')']:
             ampl = ampl.replace(symbol, f' {symbol} ')
 
@@ -145,8 +149,12 @@ class Tokenizer:
     def tgt_tokenize(self, sqampl):
         """Tokenize target expression."""
         sqampl = self.remove_whitespace(sqampl)
-        sqampl = self.src_replace(sqampl) if self.to_replace else sqampl
-
+        sqampl = self.tgt_replace(sqampl) if self.to_replace else sqampl
+        sqampl = sqampl.replace("(theta_W)", "_theta_W")
+        
+        for symbol in self.special_symbols:
+            sqampl = sqampl.replace(symbol, f" {symbol} ")
+        
         for symbol in ['/', '+', '-', '*', ',', '^', '%', '}', '(', ')']:
             sqampl = sqampl.replace(symbol, f' {symbol} ')
 
@@ -162,7 +170,7 @@ class Tokenizer:
 
 
 class Vocab:
-    def __init__(self, tokens, special_symbols, bos_idx, pad_idx, eos_idx, unk_idx, sep_idx):
+    def __init__(self, tokens, special_symbols, bos_idx, pad_idx, eos_idx, unk_idx, sep_idx, term_idx):
         """
         Initializes the vocabulary.
 
@@ -171,9 +179,17 @@ class Vocab:
             special_symbols (List[str]): List of special tokens like <PAD>, <UNK>, etc.
             *_idx (int): Expected index for the respective special token.
         """
-        self.token_list = special_symbols + list(tokens)
+        tokens = list(tokens)
+        for i in range(len(special_symbols)):
+            try:
+                tokens.remove(special_symbols[i])
+            except:
+                pass
+        
+        self.token_list = special_symbols + tokens
 
         self.token_to_idx = {token: idx for idx, token in enumerate(self.token_list)}
+        
         self.idx_to_token = {idx: token for token, idx in self.token_to_idx.items()}
 
         # Assertions to verify special symbol positions
@@ -182,6 +198,8 @@ class Vocab:
         assert self.token_to_idx[special_symbols[bos_idx]] == bos_idx, "BOS index mismatch"
         assert self.token_to_idx[special_symbols[eos_idx]] == eos_idx, "EOS index mismatch"
         assert self.token_to_idx[special_symbols[sep_idx]] == sep_idx, "SEP index mismatch"
+        for i in range(sep_idx+1,len(special_symbols)):
+            assert self.token_to_idx[special_symbols[i]] == term_idx[i - (sep_idx+1)], "TERM index mismatch"
 
         # Store special token values and indices
         self.unk_idx = unk_idx
@@ -189,12 +207,16 @@ class Vocab:
         self.bos_idx = bos_idx
         self.eos_idx = eos_idx
         self.sep_idx = sep_idx
+        self.term_idx = term_idx
 
         self.unk_tok = special_symbols[unk_idx]
         self.pad_tok = special_symbols[pad_idx]
         self.bos_tok = special_symbols[bos_idx]
         self.eos_tok = special_symbols[eos_idx]
         self.sep_tok = special_symbols[sep_idx]
+
+        self.special_indices = set(self.token_to_idx[sym] for sym in special_symbols)
+
 
     def encode(self, tokens):
         """Convert a list of tokens to their corresponding indices."""
@@ -205,7 +227,7 @@ class Vocab:
         if include_special_tokens:
             return [self.idx_to_token.get(idx, self.unk_tok) for idx in indices]
         else:
-            return [self.idx_to_token.get(idx, self.unk_tok) for idx in indices if idx not in {self.pad_idx, self.bos_idx, self.eos_idx, self.sep_idx}]
+            return [self.idx_to_token.get(idx, self.unk_tok) for idx in indices if idx not in self.special_indices]
 
     def __len__(self):
         return len(self.token_list)

@@ -3,7 +3,6 @@ from typing import Optional,List
 
 @dataclass
 class ModelConfig:
-    """Configuration settings for Skanformer training."""
 
     # Project & Run Information
     project_name: str
@@ -29,6 +28,7 @@ class ModelConfig:
     kan_ff_dims: List[int]
     ff_dims: int
     is_kan: bool
+    is_pre_norm: bool
     
     # Optimization & Regularization
     warmup_ratio: float
@@ -40,6 +40,7 @@ class ModelConfig:
     # Sequence Configuration
     src_max_len: int
     tgt_max_len: int
+    is_termwise: bool
 
     # Training Control
     curr_epoch: int
@@ -60,7 +61,7 @@ class ModelConfig:
     save_limit: Optional[int] = 3
     seed: Optional[int] = 42
     update_lr: Optional[float] = None
-    end_lr: Optional[float] = 1e-8
+    end_lr: Optional[float] = 1e-6
     clip_grad_norm: Optional[float] = -1
     save_last: Optional[bool] = True
     log_freq: Optional[int] = 50
@@ -95,12 +96,16 @@ class ModelTestConfig:
     nhead: int
 
     # Number of encoder layers in the transformer model
-    num_layers : int
+    num_encoder_layers : int
+    num_decoder_layers: int
 
     # KAN setting
     kan_ff_dims: List[int]
     is_kan:bool
+    is_pre_norm: bool
 
+
+    
     # FFN dims
     ff_dims: int
 
@@ -110,7 +115,8 @@ class ModelTestConfig:
     # Maximum length of source and target sequences
     src_max_len: int
     tgt_max_len: int
-
+    is_termwise: bool
+    
     kan_grid_size:Optional[int] = 8
 
     # Size of vocabulary for source and target sequences
@@ -130,7 +136,9 @@ class ModelTestConfig:
     to_replace: bool = False
 
     #token pool sizes
-    index_pool_size : int = 100   
+    index_pool_size : int = 100
 
+    dtype: Optional[str] = 'bfloat16'
+    
     def to_dict(self):
         return asdict(self)
