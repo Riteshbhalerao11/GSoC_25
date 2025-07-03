@@ -1,5 +1,6 @@
 import os
 
+
 import torch
 from tqdm import tqdm
 
@@ -9,7 +10,8 @@ from .fn_utils import (
     generate_unique_random_integers,
     get_model
 )
-from .constants import PAD_IDX, BOS_IDX, EOS_IDX, SEP_IDX
+
+from .inference import greedy_decode
 
 
 class Predictor:
@@ -52,43 +54,6 @@ class Predictor:
 
         print(f"Using epoch {state['epoch']} model for predictions.")
 
-    def greedy_decode(self, src, src_padding_mask, start_symbol):
-        """
-        Performs greedy decoding to generate predictions.
-
-        Args:
-            src (Tensor): Source tensor of shape (batch_size, src_seq_len).
-            src_padding_mask (Tensor): Source padding mask of shape (batch_size, src_seq_len).
-            start_symbol (int): Start token index.
-
-        Returns:
-            Tensor: Generated token sequence of shape (batch_size, tgt_seq_len).
-        """
-        src = src.to(self.device)
-        src_padding_mask = src_padding_mask.to(self.device)
-        batch_size = src.size(0)
-
-        ys = torch.full((batch_size, 1), start_symbol, dtype=torch.long, device=self.device)
-
-        with torch.no_grad():
-            with torch.autocast(device_type='cuda', dtype=self.dtype):
-                memory = self.model.encode(src, src_padding_mask)
-
-                for _ in range(self.max_len):
-                    tgt_padding_mask = (ys != PAD_IDX)
-
-                    out = self.model.decode(ys, memory, tgt_padding_mask, src_padding_mask)
-
-                    prob = self.model.generator(out[:, -1, :])  # (batch_size, vocab_size)
-                    _, next_word = torch.max(prob, dim=1)       # (batch_size,)
-                    next_word = next_word.unsqueeze(1)          # (batch_size, 1)
-
-                    ys = torch.cat([ys, next_word], dim=1)      
-
-                    if ((next_word == EOS_IDX) | (next_word == SEP_IDX)).all():
-                        break
-
-        return ys
 
     def predict(self, test_example, vocab, raw_tokens=False):
         """
@@ -109,9 +74,8 @@ class Predictor:
             src, torch.zeros((1, 1), dtype=self.dtype, device=self.device)
         )
 
-        tgt_tokens = self.greedy_decode(
-            src, src_padding_mask, start_symbol=test_example[1][0]
-        ).flatten()
+        tgt_tokens = greedy_decode(self.model, self.device, self.max_len,
+            src, src_padding_mask, test_example[1][0], self.dtype).flatten()
 
         if raw_tokens:
             return test_example[1], tgt_tokens

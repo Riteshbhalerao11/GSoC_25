@@ -90,19 +90,19 @@ class Trainer():
         self.is_master = self.local_rank == 0
 
         # Initialize Weights & Biases
-        if self.is_master:
-            
-            os.makedirs(config.root_dir, exist_ok=True)
+                 
+        os.makedirs(config.root_dir, exist_ok=True)
 
-            wandb.login()
-            self.run = wandb.init(
-                project=config.project_name,
-                name=config.run_name,
-                dir=config.root_dir,
-                config=config.to_dict(),
-                resume='allow',
-                id=config.run_id
-            )
+        wandb.login()
+        self.run = wandb.init(
+            project=config.project_name,
+            name=f"{config.run_name}_rank{self.global_rank}",
+            group=config.run_name,
+            dir=config.root_dir,
+            config=config.to_dict(),
+            resume='allow',
+            id=config.run_id
+        )
         
         # Initialize dataloaders
         self.dataloaders,self.valid_ds = self._prepare_dataloaders(
@@ -324,7 +324,7 @@ class Trainer():
                     tgt[:, 1:].reshape(-1)
                 )
 
-            if self.is_master and (self.global_step % self.config.log_freq == 0):
+            if (self.global_step % self.config.log_freq == 0):
                 self.run.log({'train/loss': loss.item(), 'global_step': self.global_step})
 
             running_loss += loss.item() * batch_size
@@ -361,11 +361,12 @@ class Trainer():
                 if not self.is_constant_lr:
                     self.lr_scheduler.step()
 
-            if self.is_master and (self.global_step % self.config.log_freq == 0):
+            if (self.global_step % self.config.log_freq == 0):
                 self.run.log({
                     'train/lr': self.optimizer.param_groups[0]['lr'],
                     'train/epoch': self.global_step / self.ep_steps,
                     'train/grad_norm': grad_norm,
+                    'train/scale': self.scaler.get_scale(), 
                     'global_step': self.global_step
                 })
 
@@ -476,11 +477,11 @@ class Trainer():
         """
         Train the model across all epochs.
         """
-        if self.is_master:
-            self.run.define_metric("global_step")
-            self.run.define_metric("validation/*", step_metric="global_step")
-            self.run.define_metric("train/*", step_metric="global_step")
-            self.run.define_metric("test/*", step_metric="global_step")
+    
+        self.run.define_metric("global_step")
+        self.run.define_metric("validation/*", step_metric="global_step")
+        self.run.define_metric("train/*", step_metric="global_step")
+        self.run.define_metric("test/*", step_metric="global_step")
 
         if self.current_epoch != 0:
             self.load_model(epoch=self.current_epoch, lr=self.lr)
@@ -494,11 +495,11 @@ class Trainer():
             # if self.global_step >= self.warmup_steps and not self.is_constant_lr:
             #     self.lr_scheduler.step(self.current_epoch)
 
-            if self.is_master:
-                self.run.log({
-                    'valid/loss': valid_loss,
-                    'global_step': self.global_step
-                })
+            
+            self.run.log({
+                'valid/loss': valid_loss,
+                'global_step': self.global_step
+            })
 
             self.train_loss_list.append(training_loss)
             self.valid_loss_list.append(valid_loss)
