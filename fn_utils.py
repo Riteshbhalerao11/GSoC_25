@@ -202,6 +202,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, required=True, help="Total number of epochs")
     parser.add_argument("--training_batch_size", type=int, required=True, help="Batch size for training")
     parser.add_argument("--valid_batch_size", type=int, required=True, help="Batch size for validation")
+    parser.add_argument("--test_batch_size", type=int, default=None, help="Batch size for testing (defaults to valid_batch_size)")
     parser.add_argument("--num_workers", type=int, required=True, help="Number of data loader workers")
 
     # Model architecture
@@ -271,6 +272,9 @@ def parse_args():
     # Post-parse validation
     if args.is_kan and args.kan_ff_dims is None:
         parser.error("--kan_ff_dims is required when --is_kan is set.")
+    
+    if args.test_batch_size is None:
+        args.test_batch_size = args.valid_batch_size
 
     return args
 
@@ -292,6 +296,7 @@ def create_config_from_args(args):
         epochs=args.epochs,
         training_batch_size=args.training_batch_size,
         valid_batch_size=args.valid_batch_size,
+        test_batch_size=args.test_batch_size,
         num_workers=args.num_workers,
 
         # Model architecture

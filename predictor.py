@@ -2,6 +2,7 @@ import os
 
 
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
 from .fn_utils import (
@@ -12,25 +13,10 @@ from .fn_utils import (
 )
 
 from .inference import greedy_decode
+from .constants import PAD_IDX
 
 
 class Predictor:
-    """
-    Class for generating predictions using a trained model and greedy decoding.
-
-    Args:
-        config (object): Configuration object containing model and inference settings.
-        load_best (bool, optional): Whether to load the best model. Defaults to True.
-        epoch (int, optional): Epoch number to load a specific checkpoint.
-
-    Attributes:
-        model (Model): Trained model for prediction.
-        path (str): Path to the trained model checkpoint.
-        device (str): Device for inference.
-        checkpoint (str): Model checkpoint filename.
-        max_len (int): Maximum target sequence length for inference.
-    """
-
     def __init__(self, config, load_best=True, epoch=None):
         self.model = get_model(config)
         self.checkpoint = (
@@ -39,14 +25,12 @@ class Predictor:
         )
         self.path = os.path.join(config.root_dir, self.checkpoint)
         self.device = config.device
-        if config.dtype == 'bfloat16':
-            self.dtype = torch.bfloat16
-        elif config.dtype == 'float32':
-            self.dtype = torch.float32
-        elif config.dtype == 'float16':
-            self.dtype = torch.float16
+        self.dtype = {
+            'bfloat16': torch.bfloat16,
+            'float16': torch.float16,
+            'float32': torch.float32
+        }[config.dtype]
 
-        # Load model checkpoint
         state = torch.load(self.path, map_location=self.device)
         self.model.load_state_dict(state['state_dict'])
         self.model.to(self.device)
@@ -54,75 +38,66 @@ class Predictor:
 
         print(f"Using epoch {state['epoch']} model for predictions.")
 
-
-    def predict(self, test_example, vocab, raw_tokens=False):
+    def predict_batch(self, batch, vocab, raw_tokens=False):
         """
-        Generates predictions for a given test example.
-
         Args:
-            test_example (tuple): Tuple containing source tensor and original tokens.
-            itos (dict): Index-to-string vocabulary mapping.
-            raw_tokens (bool, optional): Whether to return raw token outputs. Defaults to False.
+            batch: list of test examples (src_tensor, original_tokens)
+            vocab: tokenizer
+            raw_tokens: if True, return (ground_truth, prediction) token lists
 
         Returns:
-            str or tuple: Decoded equation or tuple of original and generated tokens.
+            List of decoded strings or token tuples
         """
         self.model.eval()
+        batch_size = len(batch)
+        src = pad_sequence([example[0] for example in batch], padding_value=PAD_IDX, batch_first=True)
+        original_tokens = [example[1] for example in batch]
+        start_symbols = torch.stack([example[1][0] for example in batch],dim=0).reshape(batch_size, 1)
 
-        src = test_example[0].unsqueeze(0)
         src_padding_mask, _ = create_mask(
-            src, torch.zeros((1, 1), dtype=self.dtype, device=self.device)
+            src, torch.zeros((batch_size, 1), dtype=self.dtype, device=self.device)
         )
-
-        tgt_tokens = greedy_decode(self.model, self.device, self.max_len,
-            src, src_padding_mask, test_example[1][0], self.dtype).flatten()
+        with torch.no_grad():
+            tgt_tokens = greedy_decode(
+                self.model, self.device, self.max_len,
+                src, src_padding_mask,
+                start_symbols=start_symbols,
+                dtype=self.dtype
+            )
 
         if raw_tokens:
-            return test_example[1], tgt_tokens
+            return [(gt, pred) for gt, pred in zip(original_tokens, tgt_tokens)]
 
-        return ''.join(vocab.decode(tgt_tokens))
+        return [vocab.decode(seq) for seq in tgt_tokens]
 
 
-def sequence_accuracy(config, test_ds, vocab, load_best=True, epoch=None, test_size=100):
-    """
-    Calculate the sequence accuracy.
 
-    Args:
-        config (object): Configuration for inference.
-        test_ds (list): Dataset for testing.
-        tgt_itos (dict): Index-to-token mapping.
-        load_best (bool, optional): Whether to load the best model. Defaults to True.
-        epoch (int, optional): Specific epoch to load. Defaults to None.
-        test_size (int, optional): Number of test samples to evaluate. Defaults to 100.
-
-    Returns:
-        float: Sequence accuracy.
-    """
+def sequence_accuracy(config, test_ds, vocab, load_best=True, epoch=None, test_size=1000):
     predictor = Predictor(config, load_best, epoch)
-    count = 0
+    test_batch_size = config.test_batch_size
     num_samples = 10 if config.debug else test_size
 
-    random_idx = generate_unique_random_integers(
-        num_samples, start=0, end=len(test_ds)
-    )
-    length = len(random_idx)
+    random_idx = generate_unique_random_integers(num_samples, start=0, end=len(test_ds))
+    count = 0
+    total = 0
 
-    pbar = tqdm(range(length))
+    pbar = tqdm(range(0, num_samples, test_batch_size))
     pbar.set_description("Seq_Acc_Cal")
 
     for i in pbar:
-        original_tokens, predicted_tokens = predictor.predict(
-            test_ds[random_idx[i]], vocab, raw_tokens=True
-        )
-        original_tokens = original_tokens.detach().numpy().tolist()
-        predicted_tokens = predicted_tokens.detach().cpu().numpy().tolist()
+        batch_indices = random_idx[i:min(i + test_batch_size, num_samples)]
+        batch = [test_ds[idx] for idx in batch_indices]
 
-        original = decode_sequence(original_tokens, vocab)
-        predicted = decode_sequence(predicted_tokens, vocab)
+        raw_pairs = predictor.predict_batch(batch, vocab, raw_tokens=True)
 
-        if original == predicted:
-            count += 1
+        for gt_tokens, pred_tokens in raw_pairs:
+            gt = decode_sequence(gt_tokens.detach().cpu().tolist(), vocab)
+            pred = decode_sequence(pred_tokens.detach().cpu().tolist(), vocab)
 
-        pbar.set_postfix(seq_accuracy=count / (i + 1))
+            if gt == pred:
+                count += 1
+            total += 1
 
-    return count / length
+        pbar.set_postfix(seq_accuracy=count / total)
+
+    return count / total

@@ -343,7 +343,14 @@ class Trainer():
                 )
 
             self.scaler.step(self.optimizer)
-            self.scaler.update()
+            
+            # Limit the grad scaler
+            MAX_SCALE = 1e7
+            current_scale = self.scaler.get_scale()
+            if current_scale > MAX_SCALE:
+                self.scaler.update(new_scale=MAX_SCALE)
+            else:
+                self.scaler.update()
 
             # Compute gradient norm for logging
             grads = [

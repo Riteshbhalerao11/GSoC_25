@@ -18,6 +18,7 @@ class ModelConfig:
     epochs: int
     training_batch_size: int
     valid_batch_size: int
+    test_batch_size: int
     num_workers: int
 
     # Model Architecture
@@ -81,6 +82,8 @@ class ModelTestConfig:
 
     # Model name
     model_name: str
+    
+    test_batch_size: int
 
     # Directory where data and model checkpoints will be stored
     root_dir: str
