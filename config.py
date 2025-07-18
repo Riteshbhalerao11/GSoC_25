@@ -14,6 +14,7 @@ class ModelConfig:
     data_dir: str
 
     # Hardware & Training Setup
+    finetune: bool
     device: str
     epochs: int
     training_batch_size: int
@@ -42,6 +43,7 @@ class ModelConfig:
     src_max_len: int
     tgt_max_len: int
     is_termwise: bool
+    is_beamsearch: bool
 
     # Training Control
     curr_epoch: int
@@ -52,6 +54,9 @@ class ModelConfig:
     resume_best: bool
 
     # Optional Parameters
+    temperature: Optional[float] = 0.0
+    sample_freq: Optional[int] = 5
+    beam_width: Optional[int] = 5
     kan_grid_size:Optional[int] = 8
     dtype: Optional[str] = 'bfloat16'
     run_id: Optional[str] = None
@@ -119,7 +124,9 @@ class ModelTestConfig:
     src_max_len: int
     tgt_max_len: int
     is_termwise: bool
-    
+    is_beamsearch: bool
+    beam_width: int = 5
+
     kan_grid_size:Optional[int] = 8
 
     # Size of vocabulary for source and target sequences

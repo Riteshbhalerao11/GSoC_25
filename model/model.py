@@ -8,6 +8,7 @@ import copy
 from .sinekan import KANFeedForwardBlock
 from .utils import TokenEmbedding, PositionalEncoding
 
+
 class FlashMHA(nn.Module):
     """
     Multi-Head Attention module using FlashAttention backend for efficient computation.
@@ -50,89 +51,63 @@ class FlashMHA(nn.Module):
         is_cross: bool = False,
         causal: bool = False
     ) -> torch.Tensor:
-        """
-        Forward pass for Flash Multi-Head Attention.
-
-        Args:
-            q (Tensor): Query tensor of shape (batch, seq_len, embed_dim).
-            k (Tensor, optional): Key tensor. Defaults to None (for self-attention).
-            v (Tensor, optional): Value tensor. Defaults to None (for self-attention).
-            padding_mask (Tensor, optional): Mask tensor with True/1 for valid tokens. Defaults to None.
-            is_cross (bool, optional): Indicates whether this is cross-attention. Defaults to False.
-            causal (bool, optional): Whether to apply causal masking. Defaults to False.
-
-        Returns:
-            Tensor: Output tensor of shape (batch, seq_len, embed_dim).
-        """
         b, l_q, _ = q.shape
         device = q.device
 
         if not is_cross:
-            # Self-attention mode: Q = K = V
             k, v = q, q
-
-        # Project inputs
-        q_proj = self.q_proj(q)
-        k_proj = self.k_proj(k)
-        v_proj = self.v_proj(v)
 
         # Handle padding mask
         if padding_mask is None:
             padding_mask = torch.ones((b, k.shape[1]), dtype=torch.bool, device=device)
-        else:
-            if padding_mask.shape != (b, k.shape[1]):
-                raise ValueError(
-                    f"padding_mask shape {padding_mask.shape} does not match "
-                    f"expected shape ({b}, {k.shape[1]})"
-                )
+        elif padding_mask.shape != (b, k.shape[1]):
+            raise ValueError(
+                f"padding_mask shape {padding_mask.shape} does not match "
+                f"expected shape ({b}, {k.shape[1]})"
+            )
 
-        # Set dropout to 0 during evaluation
         dropout_p = self.dropout if self.training else 0.0
 
-        if not is_cross:
-            # Self-attention mode
-            qkv = torch.stack([q_proj, k_proj, v_proj], dim=1)  # (b, 3, l, d)
-            qkv = qkv.transpose(1, 2)  # (b, l, 3, d)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            q_proj = self.q_proj(q)
+            k_proj = self.k_proj(k)
+            v_proj = self.v_proj(v)
 
-            qkv, indices, cu_seqlens, max_s, _ = unpad_input(qkv, padding_mask)
-            qkv = qkv.view(-1, 3, self.num_heads, self.head_dim)
+            if not is_cross:
+                qkv = torch.stack([q_proj, k_proj, v_proj], dim=1).transpose(1, 2)  # (b, l, 3, d)
+                qkv, indices, cu_seqlens, max_s, _ = unpad_input(qkv, padding_mask)
+                qkv = qkv.view(-1, 3, self.num_heads, self.head_dim)
 
-            out_unpad = flash_attn_varlen_qkvpacked_func(
-                qkv,
-                cu_seqlens,
-                max_s,
-                dropout_p=dropout_p,
-                softmax_scale=None,
-                causal=causal
-            )
-        else:
-            # Cross-attention mode
-            q_mask = torch.ones((b, l_q), dtype=torch.bool, device=device)
-            q_packed, q_indices, cu_q, max_q, _ = unpad_input(q_proj, q_mask)
+                out_unpad = flash_attn_varlen_qkvpacked_func(
+                    qkv, cu_seqlens, max_s,
+                    dropout_p=dropout_p,
+                    softmax_scale=None,
+                    causal=causal
+                )
+            else:
+                q_mask = torch.ones((b, l_q), dtype=torch.bool, device=device)
+                q_packed, q_indices, cu_q, max_q, _ = unpad_input(q_proj, q_mask)
 
-            kv = torch.stack([k_proj, v_proj], dim=2)  # (b, l_k, 2, d)
-            kv, _, cu_k, max_k, _ = unpad_input(kv, padding_mask)
+                kv = torch.stack([k_proj, v_proj], dim=2)
+                kv, _, cu_k, max_k, _ = unpad_input(kv, padding_mask)
 
-            q_packed = q_packed.view(-1, self.num_heads, self.head_dim)
-            kv = kv.view(-1, 2, self.num_heads, self.head_dim)
+                q_packed = q_packed.view(-1, self.num_heads, self.head_dim)
+                kv = kv.view(-1, 2, self.num_heads, self.head_dim)
 
-            out_unpad = flash_attn_varlen_kvpacked_func(
-                q_packed,
-                kv,
-                cu_q,
-                cu_k,
-                max_q,
-                max_k,
-                dropout_p=dropout_p,
-                softmax_scale=None,
-                causal=causal
-            )
+                out_unpad = flash_attn_varlen_kvpacked_func(
+                    q_packed, kv,
+                    cu_q, cu_k,
+                    max_q, max_k,
+                    dropout_p=dropout_p,
+                    softmax_scale=None,
+                    causal=causal
+                )
 
-        # Re-pad output and apply final projection
-        out = out_unpad.reshape(-1, self.embed_dim)
+        # Re-pad output and apply final projection — this should be done in float32
+        out = out_unpad.reshape(-1, self.embed_dim).to(torch.float32)
         out = pad_input(out, q_indices if is_cross else indices, b, l_q)
-
         return self.out_proj(out)
+
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(
@@ -368,7 +343,7 @@ class Transformer(nn.Module):
         layer_norm_eps: float = 1e-5,
         norm_first: bool = False,
         bias: bool = True,
-        device: Union[int, str, None] = 'cpu',
+        device: Union[int, str, None] = 'cuda',
         dtype=None,
     ):
         super().__init__()
@@ -482,9 +457,10 @@ class Model(nn.Module):
         kan_ff_dims: Optional[list] = None,
         kan_grid_size: int = 8,
         device: Union[int, str, None] = None,
-        dtype=None,
+        dtype=torch.float32,
     ):
         super().__init__()
+        print("YAAYY")
         self.transformer = Transformer(
             embed_size=embed_size,
             nhead=nhead,
