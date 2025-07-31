@@ -54,9 +54,10 @@ if __name__ == '__main__':
     config.src_voc_size = len(src_vocab)
     config.tgt_voc_size = len(tgt_vocab)
 
-    if config.debug:
-        config.epochs = 1
-        df_train = df_train.sample(1000).reset_index(drop=True)
+    # if config.debug:
+
+        # config.epochs = 1
+        # df_train = df_train.sample(1000).reset_index(drop=True)
 
     logger.info(f"TRAIN SAMPLES: {df_train.shape}")
     logger.info("Data loading complete")

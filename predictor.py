@@ -119,7 +119,9 @@ def sequence_accuracy(config, test_ds, vocab, load_best=True, epoch=None, test_s
 
         original = decode_sequence(original_tokens, vocab)
         predicted = decode_sequence(predicted_tokens, vocab)
-
+        if i==0:
+            print('original:',original)
+            print('predicted:',predicted)
         if original == predicted:
             count += 1
 

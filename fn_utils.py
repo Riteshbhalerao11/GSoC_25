@@ -9,8 +9,10 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 
 from .config import ModelConfig
-from .model.model import Model
-from .model.sinekan import SineKANLayer
+from .model.model_factory import construct_model
+# from .model.model import Model
+# from .model.sinekan import SineKANLayer
+from .model.helpers.mamba import MixerModel, MambaDecoder
 
 from .constants import BOS_IDX, EOS_IDX, PAD_IDX, SPECIAL_SYMBOLS, UNK_IDX, SEP_IDX, T_IDX
 from .tokenizer import Tokenizer, Vocab
@@ -128,22 +130,22 @@ def calculate_line_params(point1, point2):
     b = y1 - m * x1
     return m, b
 
-def init_transformer_weights(module, is_kan):
+# def init_transformer_weights(module, is_mamba):
 
-    if is_kan and isinstance(module, SineKANLayer):
-        return  
+#     if is_mamba and isinstance(module, MixerModel):
+#         return  
 
-    if isinstance(module, nn.Linear):
-        nn.init.xavier_normal_(module.weight, gain=nn.init.calculate_gain('relu'))
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
+#     if isinstance(module, nn.Linear):
+#         nn.init.xavier_normal_(module.weight, gain=nn.init.calculate_gain('relu'))
+#         if module.bias is not None:
+#             nn.init.zeros_(module.bias)
 
-    elif isinstance(module, nn.Embedding):
-        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+#     elif isinstance(module, nn.Embedding):
+#         nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    elif isinstance(module, nn.LayerNorm):
-        nn.init.ones_(module.weight)
-        nn.init.zeros_(module.bias)
+#     elif isinstance(module, nn.LayerNorm):
+#         nn.init.ones_(module.weight)
+#         nn.init.zeros_(module.bias)
 
 
 def get_model(config):
@@ -155,26 +157,27 @@ def get_model(config):
     Returns:
         Model: Initialized Transformer model.
     """
-        
-    model = Model(
-        config.num_encoder_layers,
-        config.num_decoder_layers,
-        config.embedding_size,
-        config.nhead,
-        config.src_voc_size,
-        config.tgt_voc_size,
-        config.ff_dims,
-        config.dropout,
-        config.is_pre_norm,
-        config.is_kan,
-        config.kan_ff_dims,
-        config.kan_grid_size,
-        config.device
-    )
-
-    model.apply(lambda m: init_transformer_weights(m, config.is_kan))
+    model = construct_model(config)
     
-    logger.info("Weights initialized")
+    # model = Model(
+    #     config.num_encoder_layers,
+    #     config.num_decoder_layers,
+    #     config.embedding_size,
+    #     config.nhead,
+    #     config.src_voc_size,
+    #     config.tgt_voc_size,
+    #     config.ff_dims,
+    #     config.dropout,
+    #     config.is_pre_norm,
+    #     config.is_kan,
+    #     config.kan_ff_dims,
+    #     config.kan_grid_size,
+    #     config.device
+    # )
+
+    # model.apply(lambda m: init_transformer_weights(m, config.is_mamba))
+    
+    # logger.info("Weights initialized")
     
     logger.info(str(model)) 
 
@@ -210,10 +213,10 @@ def parse_args():
     parser.add_argument("--nhead", type=int, required=True, help="Number of attention heads")
     parser.add_argument("--num_encoder_layers", type=int, required=True, help="Number of encoder layers")
     parser.add_argument("--num_decoder_layers", type=int, required=True, help="Number of decoder layers")
-    parser.add_argument("--is_pre_norm", action="store_true", help="Location of normalization layers")
-    parser.add_argument('--kan_ff_dims', type=parse_ff_dims, help='KAN layer sizes (comma-separated)')
-    parser.add_argument("--is_kan", action="store_true", help="Use KAN layers")
-    parser.add_argument("--kan_grid_size", type=int, default=8, help="KAN grid size")
+    # parser.add_argument("--is_pre_norm", action="store_true", help="Location of normalization layers")
+    # parser.add_argument('--kan_ff_dims', type=parse_ff_dims, help='KAN layer sizes (comma-separated)')
+    # parser.add_argument("--is_kan", action="store_true", help="Use KAN layers")
+    # parser.add_argument("--kan_grid_size", type=int, default=8, help="KAN grid size")
 
     # Optimization settings
     parser.add_argument("--warmup_ratio", type=float, required=True, help="Warmup ratio for learning rate")
@@ -260,6 +263,7 @@ def parse_args():
     parser.add_argument("--log_freq", type=int, default=50, help="Logging frequency (steps)")
     parser.add_argument("--test_freq", type=int, default=10, help="Testing frequency (steps)")
     parser.add_argument("--truncate", action="store_true", help="Truncate sequences")
+    parser.add_argument("--filter_len", action="store_true", help="Filter dataset with sequence length")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 
     # Tokenizer settings
@@ -269,8 +273,8 @@ def parse_args():
     args = parser.parse_args()
 
     # Post-parse validation
-    if args.is_kan and args.kan_ff_dims is None:
-        parser.error("--kan_ff_dims is required when --is_kan is set.")
+    # if args.is_kan and args.kan_ff_dims is None:
+    #     parser.error("--kan_ff_dims is required when --is_kan is set.")
 
     return args
 
@@ -300,10 +304,10 @@ def create_config_from_args(args):
         nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers,
         num_decoder_layers=args.num_decoder_layers,
-        is_pre_norm=args.is_pre_norm,
-        kan_ff_dims=args.kan_ff_dims,
-        is_kan=args.is_kan,
-        kan_grid_size=args.kan_grid_size,
+        # is_pre_norm=args.is_pre_norm,
+        # kan_ff_dims=args.kan_ff_dims,
+        # is_kan=args.is_kan,
+        # kan_grid_size=args.kan_grid_size,
 
         # Optimization settings
         warmup_ratio=args.warmup_ratio,
@@ -349,6 +353,7 @@ def create_config_from_args(args):
         log_freq=args.log_freq,
         test_freq=args.test_freq,
         truncate=args.truncate,
+        filter_len=args.filter_len,
         debug=args.debug,
 
         # Tokenizer settings

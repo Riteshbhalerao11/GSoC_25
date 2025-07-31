@@ -2,7 +2,9 @@ from torch.utils.data import Dataset
 import torch
 
 from .constants import BOS_IDX, PAD_IDX, EOS_IDX
+from .logger import get_logger
 
+logger = get_logger(__name__)
 class Data(Dataset):
     """
     Custom PyTorch dataset for handling data.
@@ -13,8 +15,7 @@ class Data(Dataset):
 
     def __init__(self, df, tokenizer, config, src_vocab, tgt_vocab):
         super(Data, self).__init__()
-        self.tgt_vals = df['sqamp']
-        self.src_vals = df['amp']
+        self.config = config
         self.tgt_tokenize = tokenizer.tgt_tokenize
         self.src_tokenize = tokenizer.src_tokenize
         self.bos_token = torch.tensor([BOS_IDX], dtype=torch.int64)
@@ -22,7 +23,18 @@ class Data(Dataset):
         self.pad_token = torch.tensor([PAD_IDX], dtype=torch.int64)
         self.src_vocab = src_vocab
         self.tgt_vocab = tgt_vocab
-        self.config = config
+
+        if self.config.filter_len:
+            df = df[
+                (df['sqamp'].str.len() <= self.config.tgt_max_len) &
+                (df['amp'].str.len() <= self.config.src_max_len)
+            ].reset_index(drop=True)
+            logger.info(f"Filtered data size is: {len(df)}")
+            
+        self.tgt_vals = df['sqamp']
+        self.src_vals = df['amp']
+        
+        
 
     def __len__(self):
         """
@@ -58,7 +70,7 @@ class Data(Dataset):
                 tgt_ids = tgt_ids[:self.config.tgt_max_len-3]
         else:
             if enc_excess_tokens < 0 or dec_excess_tokens < 0:
-                raise ValueError("Sentence is too long")
+                raise ValueError(f"Sentence is too long \n enc_excess_tokens: {enc_excess_tokens}, dec_excess_tokens: {dec_excess_tokens}")
             
         if self.config.is_termwise:
             src_tensor = torch.cat(

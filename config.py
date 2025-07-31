@@ -25,10 +25,10 @@ class ModelConfig:
     nhead: int
     num_encoder_layers: int
     num_decoder_layers: int
-    kan_ff_dims: List[int]
+    # kan_ff_dims: List[int]
     ff_dims: int
-    is_kan: bool
-    is_pre_norm: bool
+    # is_kan: bool
+    # is_pre_norm: bool
     
     # Optimization & Regularization
     warmup_ratio: float
@@ -67,6 +67,7 @@ class ModelConfig:
     log_freq: Optional[int] = 50
     test_freq: Optional[int] = 10
     truncate: Optional[bool] = False
+    filter_len: Optional[bool] = False
     debug: Optional[bool] = False
     to_replace: bool = False
     index_pool_size: int = 100
@@ -100,9 +101,9 @@ class ModelTestConfig:
     num_decoder_layers: int
 
     # KAN setting
-    kan_ff_dims: List[int]
-    is_kan:bool
-    is_pre_norm: bool
+    # kan_ff_dims: List[int]
+    # is_kan:bool
+    # is_pre_norm: bool
 
 
     

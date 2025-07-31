@@ -159,7 +159,8 @@ class Trainer():
         """
         model = get_model(self.config)
         model.to(self.device)
-        ddp_model = DDP(model, device_ids=[self.device])
+        # ddp_model = DDP(model, device_ids=[self.device])
+        ddp_model = DDP(model, device_ids=[self.device], find_unused_parameters=True)
         if self.is_master:
             self.run.watch(ddp_model.module,log_freq=20)
         return model, ddp_model
