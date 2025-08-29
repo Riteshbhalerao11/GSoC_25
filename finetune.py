@@ -184,7 +184,7 @@ class SCSTrainer():
         # Final scalar loss: mean over all examples
         # print(loss)
         # print(loss.mean())
-        print(advantage.detach())
+
         return loss.mean(), advantage.detach()
 
 
@@ -392,16 +392,17 @@ class SCSTrainer():
                     index=decoded_target.unsqueeze(-1)
                 ).squeeze(-1)  # shape: [batch*k, seq_len]
 
-            logprobs = logprobs * tgt_padding_mask # mask out padding tokens
-            # print(logprobs)
-            logprobs = logprobs.sum(dim=1) # shape: [batch*k]
+                logprobs = logprobs * tgt_padding_mask # mask out padding tokens
+                # print(logprobs)
+                # logprobs = logprobs.sum(dim=1) # shape: [batch*k]
+                seq_lens = tgt_padding_mask.sum(dim=1)  # number of non-padding tokens per sequence
+                logprobs = logprobs.sum(dim=1) / seq_lens.clamp(min=1)
 
-            # print(logprobs)
-            rewards_tensor = torch.tensor(rewards, dtype=self.dtype, device=self.device)
+                # print(logprobs)
+                rewards_tensor = torch.tensor(rewards, dtype=self.dtype, device=self.device)
 
 
-            loss, advantage = self.criterion(logprobs, rewards_tensor)
-
+                loss, advantage = self.criterion(logprobs, rewards_tensor)
             
             if (self.global_step % self.config.log_freq == 0):
                 self.run.log({

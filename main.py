@@ -29,6 +29,7 @@ def main(config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab):
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # torch.use_deterministic_algorithms(True)
 
     if config.finetune:
         logger.info("Starting fine-tuning...")
@@ -38,6 +39,15 @@ def main(config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab):
             config.temperature = 1.3
         
         finetune_dir = os.path.join(config.root_dir, "finetune")
+        
+        inc_idxs = np.load(os.path.join(finetune_dir, "inc_idx.npy"))
+        sample_size = int(inc_idxs.shape[0] * 0.5)
+        corr_idxs = [i for i in range(len(df_train)) if i not in inc_idxs]
+        corr_sample = np.array(random.sample(corr_idxs, sample_size))
+        merged_idxs = np.concatenate([inc_idxs, corr_sample])
+        df_train = df_train.iloc[merged_idxs].reset_index(drop=True)
+        logger.info(f"Fine-tuning on {len(df_train)} samples")
+        # print(df_train.shape)
         trainer = SCSTrainer(config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab, finetune_dir)
         trainer.fit()
 

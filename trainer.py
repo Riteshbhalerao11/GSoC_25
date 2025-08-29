@@ -345,7 +345,7 @@ class Trainer():
             self.scaler.step(self.optimizer)
             
             # Limit the grad scaler
-            MAX_SCALE = 1e30
+            MAX_SCALE = 1e35
             current_scale = self.scaler.get_scale()
             if current_scale > MAX_SCALE:
                 self.scaler.update(new_scale=MAX_SCALE)

@@ -15,19 +15,48 @@ class PositionalEncoding(nn.Module):
 
     def __init__(self, embed_size: int, dropout: float, maxlen: int = 5000):
         super(PositionalEncoding, self).__init__()
-        den = torch.exp(-torch.arange(0, embed_size, 2)
-                        * math.log(10000) / embed_size)
+        den = torch.exp(-torch.arange(0, embed_size, 2) * math.log(10000) / embed_size)
         pos = torch.arange(0, maxlen).reshape(maxlen, 1)
         pos_embedding = torch.zeros((maxlen, embed_size))
         pos_embedding[:, 0::2] = torch.sin(pos * den)
         pos_embedding[:, 1::2] = torch.cos(pos * den)
-        pos_embedding = pos_embedding.unsqueeze(-2)
+        pos_embedding = pos_embedding.unsqueeze(0)  # (1, maxlen, embed_size)
 
         self.dropout = nn.Dropout(dropout)
         self.register_buffer('pos_embedding', pos_embedding)
 
-    def forward(self, token_embedding: Tensor):
-        return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
+    def forward(self, token_embedding: Tensor) -> Tensor:
+        # token_embedding: (batch_size, seq_len, embed_size)
+        seq_len = token_embedding.size(1)
+        pos = self.pos_embedding[:, :seq_len, :]  # (1, seq_len, embed_size)
+        return self.dropout(token_embedding + pos)
+    
+
+# class PositionalEncoding(nn.Module):
+#     """
+#     Positional encoding module for transformer architectures.
+
+#     Args:
+#         embed_size (int): The embedding size.
+#         dropout (float): Dropout rate.
+#         maxlen (int, optional): Maximum sequence length. Defaults to 5000.
+#     """
+
+#     def __init__(self, embed_size: int, dropout: float, maxlen: int = 5000):
+#         super(PositionalEncoding, self).__init__()
+#         den = torch.exp(-torch.arange(0, embed_size, 2)
+#                         * math.log(10000) / embed_size)
+#         pos = torch.arange(0, maxlen).reshape(maxlen, 1)
+#         pos_embedding = torch.zeros((maxlen, embed_size))
+#         pos_embedding[:, 0::2] = torch.sin(pos * den)
+#         pos_embedding[:, 1::2] = torch.cos(pos * den)
+#         pos_embedding = pos_embedding.unsqueeze(-2)
+
+#         self.dropout = nn.Dropout(dropout)
+#         self.register_buffer('pos_embedding', pos_embedding)
+
+#     def forward(self, token_embedding: Tensor):
+#         return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
 
 
 class TokenEmbedding(nn.Module):

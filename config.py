@@ -30,7 +30,9 @@ class ModelConfig:
     kan_ff_dims: List[int]
     ff_dims: int
     is_kan: bool
+    is_kan_embed: bool
     is_pre_norm: bool
+    use_torch_mha: bool
     
     # Optimization & Regularization
     warmup_ratio: float
@@ -55,7 +57,7 @@ class ModelConfig:
 
     # Optional Parameters
     temperature: Optional[float] = 0.0
-    sample_freq: Optional[int] = 5
+    sample_freq: Optional[int] = 3
     beam_width: Optional[int] = 5
     kan_grid_size:Optional[int] = 8
     dtype: Optional[str] = 'bfloat16'
@@ -72,6 +74,7 @@ class ModelConfig:
     save_last: Optional[bool] = True
     log_freq: Optional[int] = 50
     test_freq: Optional[int] = 10
+    test_size: Optional[int] = 1000
     truncate: Optional[bool] = False
     debug: Optional[bool] = False
     to_replace: bool = False
@@ -112,7 +115,7 @@ class ModelTestConfig:
     is_kan:bool
     is_pre_norm: bool
 
-
+    use_torch_mha: bool
     
     # FFN dims
     ff_dims: int
@@ -126,8 +129,10 @@ class ModelTestConfig:
     is_termwise: bool
     is_beamsearch: bool
     beam_width: int = 5
-
+    
+    test_size: Optional[int] = 1000
     kan_grid_size:Optional[int] = 8
+    is_kan_embed:Optional[bool] = False
 
     # Size of vocabulary for source and target sequences
     src_voc_size: Optional[int] = None

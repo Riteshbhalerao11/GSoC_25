@@ -62,10 +62,9 @@ def greedy_decode(model, device, max_len, src, src_padding_mask, start_symbols,
 
             out = model.decode(current_ys_alive, current_memory, tgt_padding_mask, current_src_mask)
             logits = model.generator(out[:, -1, :])  # (alive, vocab)
-            log_probs = torch.log_softmax(logits, dim=-1)  # (alive, vocab)
 
             if temperature <= 0:
-                next_token = torch.argmax(log_probs, dim=-1)  # greedy
+                 _, next_token = torch.max(logits, dim=-1)  # greedy
             else:
                 next_token = sample_from_logits(logits, temperature, top_k).squeeze(1)
 

@@ -1,7 +1,7 @@
 import os
 
-
 import torch
+from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
@@ -14,6 +14,22 @@ from .fn_utils import (
 
 from .inference import greedy_decode, beam_search_decode
 from .constants import PAD_IDX
+
+
+
+def collate_fn(batch):
+    """
+    batch: list of tuples (src_tensor, original_tokens)
+    Returns:
+        src: padded src batch tensor
+        original_tokens: list of original token tensors
+    """
+    src_tensors = [example[0] for example in batch]
+    src = pad_sequence(src_tensors, padding_value=PAD_IDX, batch_first=True)
+    original_tokens = [example[1] for example in batch]
+
+    return src, original_tokens
+
 
 
 class Predictor:
@@ -51,22 +67,19 @@ class Predictor:
     def predict_batch(self, batch, vocab, raw_tokens=False):
         """
         Args:
-            batch: list of test examples (src_tensor, original_tokens)
-            vocab: tokenizer
-            raw_tokens: if True, return (ground_truth, prediction) token lists
-
-        Returns:
-            List of decoded strings or token tuples
+            batch: (src_tensor, original_tokens)
         """
         self.model.eval()
-        batch_size = len(batch)
-        src = pad_sequence([example[0] for example in batch], padding_value=PAD_IDX, batch_first=True)
-        original_tokens = [example[1] for example in batch]
-        start_symbols = torch.stack([example[1][0] for example in batch],dim=0).reshape(batch_size, 1)
+        src, original_tokens = batch
+        batch_size = src.size(0)
+
+        # Start symbols: first token from each original sequence
+        start_symbols = torch.stack([tokens[0] for tokens in original_tokens], dim=0).reshape(batch_size, 1)
 
         src_padding_mask, _ = create_mask(
             src, torch.zeros((batch_size, 1), dtype=src.dtype, device=self.device)
         )
+
         with torch.no_grad():
             if self.is_beamsearch:
                 tgt_tokens = beam_search_decode(
@@ -76,44 +89,45 @@ class Predictor:
                     dtype=self.dtype,
                     beam_width=self.beam_width
                 )
-
             else:
-                # Greedy decoding
                 tgt_tokens = greedy_decode(
                     self.model, self.device, self.max_len,
                     src, src_padding_mask,
                     start_symbols=start_symbols,
                     dtype=self.dtype
                 )
-                
 
         if raw_tokens:
             return [(gt, pred) for gt, pred in zip(original_tokens, tgt_tokens)]
-
         return [vocab.decode(seq.tolist()) for seq in tgt_tokens]
 
 
-
-def sequence_accuracy(config, test_ds, vocab, load_best=True, epoch=None, test_size=1000, return_incorrect=False):
+def sequence_accuracy(config, test_ds, vocab, load_best=True, epoch=None, return_incorrect=False):
+    test_size = config.test_size
     if hasattr(config, 'finetune') and config.finetune:
-        test_size = 3000
+        test_size = 5000
     predictor = Predictor(config, load_best, epoch)
-    test_batch_size = config.test_batch_size
     num_samples = 10 if config.debug else test_size
 
-    random_idx = generate_unique_random_integers(num_samples, start=0, end=len(test_ds))
-    count = 0
-    total = 0
-    incorrect_seqs = []  # (gt, pred)
-    incorrect_idxs = []  # dataset indices
+    if num_samples >= len(test_ds):
+        eval_indices = list(range(len(test_ds)))
+    else:
+        eval_indices = generate_unique_random_integers(num_samples, start=0, end=len(test_ds))
 
-    pbar = tqdm(range(0, num_samples, test_batch_size))
-    pbar.set_description("Seq_Acc_Cal")
+    eval_subset = torch.utils.data.Subset(test_ds, eval_indices)
 
-    for i in pbar:
-        batch_indices = random_idx[i:min(i + test_batch_size, num_samples)]
-        batch = [test_ds[idx] for idx in batch_indices]
+    dataloader = DataLoader(
+        eval_subset,
+        batch_size=config.test_batch_size,
+        shuffle=False,          
+        collate_fn=collate_fn
+    )
 
+    count, total = 0, 0
+    incorrect_seqs, incorrect_idxs = [], []
+
+    pbar = tqdm(dataloader, desc="Seq_Acc_Cal")
+    for batch_start, batch in enumerate(pbar):
         raw_pairs = predictor.predict_batch(batch, vocab, raw_tokens=True)
 
         for j, (gt_tokens, pred_tokens) in enumerate(raw_pairs):
@@ -124,7 +138,9 @@ def sequence_accuracy(config, test_ds, vocab, load_best=True, epoch=None, test_s
                 count += 1
             elif return_incorrect:
                 incorrect_seqs.append((gt, pred))
-                incorrect_idxs.append(batch_indices[j])
+    
+                subset_idx = batch_start * config.test_batch_size + j
+                incorrect_idxs.append(eval_indices[subset_idx])
 
             total += 1
 

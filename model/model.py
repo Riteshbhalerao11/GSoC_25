@@ -11,20 +11,21 @@ from .utils import TokenEmbedding, PositionalEncoding
 
 class FlashMHA(nn.Module):
     """
-    Multi-Head Attention module using FlashAttention backend for efficient computation.
+    Multi-Head Attention module using FlashAttention or PyTorch's native MultiheadAttention.
 
     Args:
         embed_dim (int): Total dimension of the model.
         num_heads (int): Number of attention heads.
-        dropout (float, optional): Dropout probability applied to attention weights. Defaults to 0.0.
-        **factory_kwargs: Additional keyword arguments passed to nn.Linear projections.
+        dropout (float): Dropout probability on attention weights.
+        use_torch_mha (bool): Whether to use PyTorch's native MultiheadAttention.
+        **factory_kwargs: Additional keyword arguments for linear layers.
     """
-
     def __init__(
         self,
         embed_dim: int,
         num_heads: int,
         dropout: float = 0.0,
+        use_torch_mha: bool = False,
         **factory_kwargs
     ):
         super().__init__()
@@ -34,37 +35,52 @@ class FlashMHA(nn.Module):
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.dropout = dropout
+        self.use_torch_mha = use_torch_mha
 
-        self.q_proj = nn.Linear(embed_dim, embed_dim, **factory_kwargs)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, **factory_kwargs)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, **factory_kwargs)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, **factory_kwargs)
-
-        self.factory_kwargs = factory_kwargs
+        if self.use_torch_mha:
+            self.mha = nn.MultiheadAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True,
+                **factory_kwargs
+            )
+        else:
+            self.q_proj = nn.Linear(embed_dim, embed_dim, **factory_kwargs)
+            self.k_proj = nn.Linear(embed_dim, embed_dim, **factory_kwargs)
+            self.v_proj = nn.Linear(embed_dim, embed_dim, **factory_kwargs)
+            self.out_proj = nn.Linear(embed_dim, embed_dim, **factory_kwargs)
 
     def forward(
         self,
         q: torch.Tensor,
-        k: torch.Tensor = None,
-        v: torch.Tensor = None,
-        padding_mask: torch.Tensor = None,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         is_cross: bool = False,
         causal: bool = False
     ) -> torch.Tensor:
+        
+        if not is_cross:
+            k = v = q
+
+        if self.use_torch_mha:
+            # PyTorch's MHA expects shape (B, L, D)
+            attn_mask = None
+            if causal and q.size(1) == k.size(1):
+                # Causal attention mask: (L, L)
+                L = q.size(1)
+                attn_mask = torch.triu(torch.ones(L, L, device=q.device), diagonal=1).bool()
+                attn_mask = attn_mask.masked_fill(attn_mask, float('-inf'))
+
+            out, _ = self.mha(q, k, v, key_padding_mask=~padding_mask if padding_mask is not None else None, attn_mask=attn_mask)
+            return out
+
         b, l_q, _ = q.shape
         device = q.device
 
-        if not is_cross:
-            k, v = q, q
-
-        # Handle padding mask
         if padding_mask is None:
             padding_mask = torch.ones((b, k.shape[1]), dtype=torch.bool, device=device)
-        elif padding_mask.shape != (b, k.shape[1]):
-            raise ValueError(
-                f"padding_mask shape {padding_mask.shape} does not match "
-                f"expected shape ({b}, {k.shape[1]})"
-            )
 
         dropout_p = self.dropout if self.training else 0.0
 
@@ -74,7 +90,7 @@ class FlashMHA(nn.Module):
             v_proj = self.v_proj(v)
 
             if not is_cross:
-                qkv = torch.stack([q_proj, k_proj, v_proj], dim=1).transpose(1, 2)  # (b, l, 3, d)
+                qkv = torch.stack([q_proj, k_proj, v_proj], dim=1).transpose(1, 2)
                 qkv, indices, cu_seqlens, max_s, _ = unpad_input(qkv, padding_mask)
                 qkv = qkv.view(-1, 3, self.num_heads, self.head_dim)
 
@@ -82,7 +98,8 @@ class FlashMHA(nn.Module):
                     qkv, cu_seqlens, max_s,
                     dropout_p=dropout_p,
                     softmax_scale=None,
-                    causal=causal
+                    causal=causal,
+                    deterministic=True
                 )
             else:
                 q_mask = torch.ones((b, l_q), dtype=torch.bool, device=device)
@@ -100,10 +117,10 @@ class FlashMHA(nn.Module):
                     max_q, max_k,
                     dropout_p=dropout_p,
                     softmax_scale=None,
-                    causal=causal
+                    causal=causal,
+                    deterministic=True
                 )
 
-        # Re-pad output and apply final projection — this should be done in float32
         out = out_unpad.reshape(-1, self.embed_dim).to(torch.float32)
         out = pad_input(out, q_indices if is_cross else indices, b, l_q)
         return self.out_proj(out)
@@ -120,6 +137,7 @@ class TransformerEncoderLayer(nn.Module):
         layer_norm_eps: float = 1e-5,
         norm_first: bool = False,
         bias: bool = True,
+        use_torch_mha: bool = False,
         device: Union[int, str, None] = None,
         dtype=None,
     ):
@@ -130,6 +148,7 @@ class TransformerEncoderLayer(nn.Module):
             embed_size,
             nhead,
             dropout=dropout,
+            use_torch_mha=use_torch_mha,
             **factory_kwargs
         )
 
@@ -187,6 +206,7 @@ class TransformerDecoderLayer(nn.Module):
         kan_ff_dims: Optional[list] = None,
         dropout: float = 0.1,
         activation: nn.Module = torch.nn.functional.gelu,
+        use_torch_mha: bool = False,
         layer_norm_eps: float = 1e-5,
         norm_first: bool = False,
         bias: bool = True,
@@ -198,8 +218,8 @@ class TransformerDecoderLayer(nn.Module):
 
         self.is_kan = is_kan
 
-        self.self_attn = FlashMHA(embed_size, nhead, dropout=dropout, **factory_kwargs)
-        self.cross_attn = FlashMHA(embed_size, nhead, dropout=dropout, **factory_kwargs)
+        self.self_attn = FlashMHA(embed_size, nhead, use_torch_mha=use_torch_mha, dropout=dropout, **factory_kwargs)
+        self.cross_attn = FlashMHA(embed_size, nhead, use_torch_mha=use_torch_mha,  dropout=dropout, **factory_kwargs)
 
         if self.is_kan:
             self.kan_ff = KANFeedForwardBlock(embed_size, kan_ff_dims, grid_size=kan_grid_size, device=device)
@@ -212,7 +232,8 @@ class TransformerDecoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(embed_size, eps=layer_norm_eps, bias=bias, **factory_kwargs)
 
         if self.is_kan and not norm_first:
-            self.norm3 = nn.LayerNorm(kan_ff_dims[-1], eps=layer_norm_eps, bias=bias, **factory_kwargs)
+            # self.norm3 = nn.LayerNorm(kan_ff_dims[-1], eps=layer_norm_eps, bias=bias, **factory_kwargs)
+            self.norm3 = None
         else:
             self.norm3 = nn.LayerNorm(embed_size, eps=layer_norm_eps, bias=bias, **factory_kwargs)
 
@@ -270,7 +291,8 @@ class TransformerDecoderLayer(nn.Module):
         else:
             x = self.norm1(x + self._sa_block(x, tgt_padding_mask, tgt_is_causal))
             x = self.norm2(x + self._cross_attn_block(x, memory, memory_padding_mask, memory_is_causal))
-            x = self.norm3(self._ff_block(x)) if self.is_kan else self.norm3(x + self._ff_block(x))
+            # x = self.norm3(self._ff_block(x)) if self.is_kan else self.norm3(x + self._ff_block(x))
+            x = self._ff_block(x) if self.is_kan else self.norm3(x + self._ff_block(x))
 
         return x
 
@@ -338,6 +360,7 @@ class Transformer(nn.Module):
         is_kan: bool = False,
         kan_ff_dims: Optional[list] = None,
         kan_grid_size: Optional[int] = None,
+        use_torch_mha: bool = False,
         dropout: float = 0.1,
         activation=nn.functional.gelu,
         layer_norm_eps: float = 1e-5,
@@ -352,6 +375,7 @@ class Transformer(nn.Module):
             embed_size,
             nhead,
             dim_feedforward=dim_feedforward,
+            use_torch_mha=use_torch_mha,
             dropout=dropout,
             activation=activation,
             layer_norm_eps=layer_norm_eps,
@@ -366,6 +390,7 @@ class Transformer(nn.Module):
             embed_size,
             nhead,
             dim_feedforward=dim_feedforward,
+            use_torch_mha=use_torch_mha,
             dropout=dropout,
             activation=activation,
             layer_norm_eps=layer_norm_eps,
@@ -390,6 +415,7 @@ class Transformer(nn.Module):
                 kan_ff_dims=kan_ff_dims,
                 kan_grid_size=kan_grid_size,
                 dropout=dropout,
+                use_torch_mha=use_torch_mha,
                 activation=activation,
                 layer_norm_eps=layer_norm_eps,
                 norm_first=norm_first,
@@ -451,22 +477,25 @@ class Model(nn.Module):
         src_vocab_size: int,
         tgt_vocab_size: int,
         dim_feedforward: int = 512,
+        use_torch_mha: bool = False,
         dropout: float = 0.1,
         is_pre_norm: bool = False,
         is_kan: bool = False,
+        is_kan_embed: bool = False,
         kan_ff_dims: Optional[list] = None,
         kan_grid_size: int = 8,
         device: Union[int, str, None] = None,
         dtype=torch.float32,
     ):
         super().__init__()
-        print("YAAYY")
+
         self.transformer = Transformer(
             embed_size=embed_size,
             nhead=nhead,
             num_encoder_layers=num_encoder_layers,
             num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
+            use_torch_mha=use_torch_mha,
             dropout=dropout,
             norm_first=is_pre_norm,
             is_kan=is_kan,
@@ -481,6 +510,9 @@ class Model(nn.Module):
         self.src_tok_emb = TokenEmbedding(src_vocab_size, embed_size)
         self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, embed_size)
         self.positional_encoding = PositionalEncoding(embed_size, dropout=dropout)
+        self.is_kan_embed = is_kan_embed
+        if is_kan_embed:
+            self.kan_embed = KANFeedForwardBlock(embed_size, [2048,512], grid_size=kan_grid_size, device=device)
     
     def encode(
             self,
@@ -500,7 +532,8 @@ class Model(nn.Module):
         Returns:
             memory: (B, S, E) – encoder outputs 
         """
-        src = self.positional_encoding(self.src_tok_emb(src))            
+        src = self.positional_encoding(self.src_tok_emb(src)) 
+        src = self.kan_embed(src) if self.is_kan_embed else src           
         return self.transformer.encoder(src, src_padding_mask=src_padding_mask, is_causal=src_is_causal)
 
     def decode(
@@ -527,6 +560,7 @@ class Model(nn.Module):
             output: (B, T, E) – decoder outputs ready for projection to logits
         """
         tgt = self.positional_encoding(self.tgt_tok_emb(tgt))
+        tgt = self.kan_embed(tgt) if self.is_kan_embed else tgt
         return self.transformer.decoder(
             tgt,
             memory,
@@ -566,6 +600,9 @@ class Model(nn.Module):
         src_emb = self.positional_encoding(self.src_tok_emb(src))
         tgt_emb = self.positional_encoding(self.tgt_tok_emb(tgt))
 
+        src_emb = self.kan_embed(src_emb) if self.is_kan_embed else src_emb
+        tgt_emb = self.kan_embed(tgt_emb) if self.is_kan_embed else tgt_emb
+        
         output = self.transformer(
             src_emb,
             tgt_emb,
