@@ -1,4 +1,5 @@
 import os
+from socketserver import ThreadingTCPServer
 
 import torch
 import wandb
@@ -9,6 +10,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .predictor import sequence_accuracy
+# from .predictor_ddp import sequence_accuracy
 from .fn_utils import (
     calculate_line_params,
     collate_fn,
@@ -16,7 +18,7 @@ from .fn_utils import (
     get_model
 )
 from .data import Data
-from .constants import PAD_IDX
+from .constants import PAD_IDX, SEP_IDX
 
 
 class Trainer():
@@ -67,30 +69,31 @@ class Trainer():
 
 
     def __init__(self, config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab):
-        
+
+
         self.scaler = GradScaler()
         self.is_constant_lr = config.is_constant_lr
-        
+
         if config.dtype == 'bfloat16':
             self.dtype = torch.bfloat16
         elif config.dtype == 'float32':
             self.dtype = torch.float32
         elif config.dtype == 'float16':
             self.dtype = torch.float16
-    
-        
+
+
         self.local_rank = int(os.environ["LOCAL_RANK"])
         self.global_rank = int(os.environ["RANK"])
-        
+
         if config.debug is not True:
-            print(f"PROCESS ID : {int(os.environ['SLURM_PROCID'])} ; TORCH GLOBAL RANK : {self.global_rank} ; TORCH LOCAL RANK : {self.local_rank}")
-        
+            print(f"PROCESS ID : {int(os.environ.get('SLURM_PROCID','0'))} ; TORCH GLOBAL RANK : {self.global_rank} ; TORCH LOCAL RANK : {self.local_rank}")
+
         self.device = self.local_rank
         self.config = config
         self.is_master = self.local_rank == 0
 
         # Initialize Weights & Biases
-                 
+
         os.makedirs(config.root_dir, exist_ok=True)
 
         wandb.login()
@@ -103,23 +106,23 @@ class Trainer():
             resume='allow',
             id=config.run_id
         )
-        
+
         # Initialize dataloaders
-        self.dataloaders,self.valid_ds = self._prepare_dataloaders(
+        self.dataloaders, self.valid_ds = self._prepare_dataloaders(
             df_train, df_valid, tokenizer, src_vocab, tgt_vocab)
 
-        self.ep_steps = len(self.dataloaders['train'])  
+        self.ep_steps = len(self.dataloaders['train'])
         self.total_steps = self.ep_steps * config.epochs
         self.warmup_steps = int(config.warmup_ratio * self.total_steps)
 
         self.root_dir = config.root_dir
         self.current_epoch = config.curr_epoch
-        
+
         # Training and valid loss lists
         self.best_val_loss = 1e6
         self.train_loss_list = []
         self.valid_loss_list = []
-        
+
         # Initialize model, optimizer, and schedulers
         self.model, self.ddp_model = self._prepare_model()
         self.optimizer = self._prepare_optimizer()
@@ -131,8 +134,8 @@ class Trainer():
         self.save_last = config.save_last
         self.lr = config.update_lr
         self.global_step = 0
-        self.tgt_vocab = tgt_vocab 
-        
+        self.tgt_vocab = tgt_vocab
+
         self.ckp_paths = [file for file in os.listdir(config.root_dir) if ('best' not in file and config.model_name in file)]
         self.save_limit = config.save_limit
 
@@ -192,17 +195,17 @@ class Trainer():
         if self.warmup_steps:
             m_warm, c_warm = calculate_line_params(
                 (0, end_lr), (self.warmup_steps, start_lr))
-            
+
             def lam_warm(step):
                 if step >= self.warmup_steps:
-                    return 1.0  
+                    return 1.0
                 return (m_warm * step + c_warm) / start_lr
-            
+
             warm_scheduler = LambdaLR(self.optimizer, lr_lambda=lam_warm)
 
         else:
             warm_scheduler = None
-        
+
         if self.is_constant_lr:
             lr_scheduler = None
         else:
@@ -228,7 +231,9 @@ class Trainer():
         """
         datasets = Data.get_data(
             df_train, None, df_valid, self.config, tokenizer,src_vocab, tgt_vocab)
-        
+        print(f'Length of train: {len(datasets["train"])}')
+        print(f'Length of valid: {len(datasets["valid"])}')
+
         sampler_train = torch.utils.data.DistributedSampler(datasets['train'], num_replicas=self.config.world_size,
                                                             rank=self.device, shuffle=self.config.train_shuffle, seed=self.config.seed)
 
@@ -236,6 +241,7 @@ class Trainer():
                                                    sampler=sampler_train, num_workers=self.config.num_workers,
                                                    pin_memory=self.config.pin_memory, collate_fn=collate_fn)
 
+        print(f'Length of train loader: {len(train_loader)}')
         dataloaders = {
             'train': train_loader,
             'valid': torch.utils.data.DataLoader(datasets['valid'],
@@ -252,32 +258,32 @@ class Trainer():
             resume (bool, optional): Whether to resume training. Defaults to False.
             epoch (int, optional): Load model from a particular epoch
         """
-        checkpoint_name = f"{self.config.model_name}_best.pth" if resume else f"{self.config.model_name}_ep{epoch}.pth"
+        checkpoint_name = f"{self.config.model_name}/best.pth" if resume else f"{self.config.model_name}/ep{epoch}.pth"
         file = os.path.join(self.root_dir, checkpoint_name)
 
         device_name = f"cuda:{self.device}"
         state = torch.load(file, map_location=device_name)
         self.model.load_state_dict(state['state_dict'])
-        
+
         if resume or (epoch is not None):
             self.train_loss_list = state['train_loss_list']
             self.valid_loss_list = state['valid_loss_list']
             self.best_val_loss = np.array(self.valid_loss_list).min()
             self.optimizer.load_state_dict(state['optimizer'])
-            
+
             if state['decay_scheduler'] is not None:
                 self.lr_scheduler.load_state_dict(state['decay_scheduler'])
             if state['warm_scheduler'] is not None:
                 self.warm_scheduler.load_state_dict(state['warm_scheduler'])
-            
+
             if 'scaler' in state:
                 self.scaler.load_state_dict(state['scaler'])
-            
+
             self.global_step = state['global_step']
 
             if epoch == None:
                 self.current_epoch = state['epoch']
-            
+
             if lr:
                 for g in self.optimizer.param_groups:
                     g['lr'] = lr
@@ -304,26 +310,115 @@ class Trainer():
         running_loss = 0.0
         total_samples = 0
 
+        running_correct = 0
+        running_tokens = 0
+
         for src, tgt in pbar:
             src = src.to(self.device)
             tgt = tgt.to(self.device)
             batch_size = src.size(0)
+
+            # print('Source:',src,'\nTarget: ',tgt)
 
             with torch.autocast(device_type='cuda', dtype=self.dtype):
                 src_padding_mask, tgt_padding_mask = create_mask(
                     src, tgt[:, :-1]
                 )
 
-                logits = self.ddp_model(
-                    src, tgt[:, :-1],
-                    src_padding_mask, tgt_padding_mask,
-                    src_padding_mask
-                )
+                if self.config.lm_head:
+                    # causal shifting
+                    input_ids = src[:, :-1].clone()
+                    labels = src[:, 1:].clone()
 
-                loss = self.criterion(
-                    logits.reshape(-1, logits.shape[-1]),
-                    tgt[:, 1:].reshape(-1)
-                )
+                    # find SEP index per row (position of SEP token)
+                    sep_pos = (src == SEP_IDX).int().argmax(dim=1)   # [B]
+
+                    # labels length is src_len - 1, so adjust cut
+                    cut_pos = sep_pos  # no -1 here because labels already shifted
+
+                    # create a range [0..L-1]
+                    L = labels.size(1)
+                    pos = torch.arange(L, device=labels.device).unsqueeze(0)  # [1, L]
+
+                    # mask everything before or equal to SEP
+                    mask = pos <= cut_pos.unsqueeze(1)  # [B, L]
+                    labels[mask] = PAD_IDX
+
+                    # forward
+                    logits = self.ddp_model(
+                        input_ids=input_ids,
+                        position_ids=None,
+                        inference_params=None,
+                    ).logits
+
+                    loss = self.criterion(
+                        logits.reshape(-1, logits.shape[-1]),
+                        labels.reshape(-1)
+                    )
+
+                    # only keep logits for tgt part
+                    tgt_len = tgt.shape[1] + 1  # +1 for EOS
+                    logits = logits[:, -tgt_len:]
+
+
+                    # print('src:', src.shape)
+                    # print('tgt:', tgt.shape)
+                    # print('loss:', loss)
+                    # print('input_ids shape:', input_ids.shape)
+                    # print('labels: ', labels.shape)
+                else:
+                    logits = self.ddp_model(
+                        src, tgt[:, :-1],
+                        src_padding_mask, tgt_padding_mask,
+                        src_padding_mask
+                    )
+                    # print(logits.shape)
+
+                    loss = self.criterion(
+                        logits.reshape(-1, logits.shape[-1]),
+                        tgt[:, 1:].reshape(-1)
+                    )
+                if self.config.lm_head:
+                    with torch.no_grad():
+                        preds = logits.argmax(dim=-1)  # (B, T_logits)
+
+                        # Get shifted targets (no BOS, ends with EOS)
+                        targets = tgt[:, 1:]           # (B, T_tgt-1)
+
+                        # Align preds with targets: keep only the last part
+                        preds = preds[:, -targets.size(1):]   # (B, T_tgt-1)
+
+                        # Mask out padding
+                        mask = targets != PAD_IDX
+
+                        correct = (preds == targets) & mask
+                        token_accuracy = correct.sum().item() / mask.sum().item()
+
+                        running_correct += correct.sum().item()
+                        running_tokens += mask.sum().item()
+                else:
+                    with torch.no_grad(): # yea different nesting is better
+                        preds = logits.argmax(dim=-1)  # (B, T_logits)
+
+                        # Get shifted targets (no BOS, ends with EOS)
+                        # targets = tgt[:, 1:]           # (B, T_tgt-1)
+
+                        # Align preds with targets: keep only the last part
+                        # preds = preds[:, -targets.size(1):]   # (B, T_tgt-1)
+
+                        # Mask out padding
+                        mask = tgt[:, 1:] != PAD_IDX
+
+                        correct = (preds == tgt[:, 1:]) & mask
+                        token_accuracy = correct.sum().item() / mask.sum().item()
+
+                        running_correct += correct.sum().item()
+                        running_tokens += mask.sum().item()
+
+                train_token_acc = running_correct / running_tokens
+
+
+
 
             if (self.global_step % self.config.log_freq == 0):
                 self.run.log({'train/loss': loss.item(), 'global_step': self.global_step})
@@ -331,7 +426,8 @@ class Trainer():
             running_loss += loss.item() * batch_size
             total_samples += batch_size
             avg_loss = running_loss / total_samples
-            pbar.set_postfix(loss=avg_loss)
+            # pbar.set_postfix(loss=avg_loss)
+            pbar.set_postfix(loss=avg_loss, acc=train_token_acc)
 
             # Backpropagation
             self.optimizer.zero_grad()
@@ -367,8 +463,9 @@ class Trainer():
                     'train/lr': self.optimizer.param_groups[0]['lr'],
                     'train/epoch': self.global_step / self.ep_steps,
                     'train/grad_norm': grad_norm,
-                    'train/scale': self.scaler.get_scale(), 
-                    'global_step': self.global_step
+                    'train/scale': self.scaler.get_scale(),
+                    'global_step': self.global_step,
+                    'train/token_accuracy': train_token_acc
                 })
 
             self.global_step += 1
@@ -394,6 +491,9 @@ class Trainer():
         running_loss = 0.0
         total_samples = 0
 
+        running_correct = 0
+        running_tokens = 0
+
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=self.dtype):
                 for src, tgt in pbar:
@@ -404,22 +504,95 @@ class Trainer():
                     src_padding_mask, tgt_padding_mask = create_mask(
                         src, tgt[:, :-1]
                     )
+                    if self.config.lm_head:
 
-                    logits = self.ddp_model(
-                        src, tgt[:, :-1],
-                        src_padding_mask, tgt_padding_mask,
-                        src_padding_mask
-                    )
+                        input_ids = src[:, :-1].clone()
+                        labels = src[:, 1:].clone()
 
-                    loss = self.criterion(
-                        logits.reshape(-1, logits.shape[-1]),
-                        tgt[:, 1:].reshape(-1)
-                    )
+                        # find SEP index per row (position of SEP token)
+                        sep_pos = (src == SEP_IDX).int().argmax(dim=1)   # [B]
 
-                    running_loss += loss.item() * batch_size
-                    total_samples += batch_size
-                    avg_loss = running_loss / total_samples
+                        # labels length is src_len - 1, so adjust cut
+                        cut_pos = sep_pos  # no -1 here because labels already shifted
 
+                        # create a range [0..L-1]
+                        L = labels.size(1)
+                        pos = torch.arange(L, device=labels.device).unsqueeze(0)  # [1, L]
+
+                        # mask everything before or equal to SEP
+                        mask = pos <= cut_pos.unsqueeze(1)  # [B, L]
+                        labels[mask] = PAD_IDX
+
+                        # forward
+                        logits = self.ddp_model(
+                            input_ids=input_ids,
+                            position_ids=None,
+                            inference_params=None,
+                        ).logits
+
+                        loss = self.criterion(
+                            logits.reshape(-1, logits.shape[-1]),
+                            labels.reshape(-1)
+                        )
+
+                        # only keep logits for tgt part
+                        tgt_len = tgt.shape[1] + 1  # +1 for EOS
+                        logits = logits[:, -tgt_len:]
+                        running_loss += loss.item() * batch_size
+                        total_samples += batch_size
+                        avg_loss = running_loss / total_samples
+
+                        preds = logits.argmax(dim=-1)  # (B, T_logits)
+
+                        # Get shifted targets (no BOS, ends with EOS)
+                        targets = tgt[:, 1:]           # (B, T_tgt-1)
+
+                        # Align preds with targets: keep only the last part
+                        preds = preds[:, -targets.size(1):]   # (B, T_tgt-1)
+
+                        # Mask out padding
+                        mask = targets != PAD_IDX
+
+                        correct = (preds == targets) & mask
+                        token_accuracy = correct.sum().item() / mask.sum().item()
+
+                        running_correct += correct.sum().item()
+                        running_tokens += mask.sum().item()
+
+                    else:
+                        logits = self.ddp_model(
+                            src, tgt[:, :-1],
+                            src_padding_mask, tgt_padding_mask,
+                            src_padding_mask
+                        )
+
+                        loss = self.criterion(
+                            logits.reshape(-1, logits.shape[-1]),
+                            tgt[:, 1:].reshape(-1)
+                        )
+
+                        running_loss += loss.item() * batch_size
+                        total_samples += batch_size
+                        avg_loss = running_loss / total_samples
+
+                        preds = logits.argmax(dim=-1)  # (B, T_logits)
+
+                        # Mask out padding
+                        mask = tgt[:, 1:] != PAD_IDX
+
+                        correct = (preds == tgt[:, 1:]) & mask
+                        token_accuracy = correct.sum().item() / mask.sum().item()
+
+                        running_correct += correct.sum().item()
+                        running_tokens += mask.sum().item()
+
+
+                val_token_acc = running_correct / running_tokens
+            if self.is_master:
+                print(f"Validation Accuracy: {val_token_acc:.4f}")
+            self.run.log({
+                "valid/token_acc":val_token_acc
+            })
         return avg_loss
 
 
@@ -433,15 +606,16 @@ class Trainer():
         ckp_path = os.path.join(self.root_dir, checkpoint_name)
         state_dict = self.ddp_model.module.state_dict()
 
+        os.makedirs(os.path.dirname(ckp_path), exist_ok=True)
         torch.save({
             "epoch": self.current_epoch + 1,
             "state_dict": state_dict,
             "optimizer": self.optimizer.state_dict(),
             "decay_scheduler": self.lr_scheduler.state_dict() if self.lr_scheduler else None,
             "warm_scheduler": self.warm_scheduler.state_dict() if self.warm_scheduler else None,
-            "scaler": self.scaler.state_dict(),            
+            "scaler": self.scaler.state_dict(),
             "train_loss_list": self.train_loss_list,
-            "valid_loss_list": self.valid_loss_list,         
+            "valid_loss_list": self.valid_loss_list,
             "global_step": self.global_step
         }, ckp_path)
 
@@ -456,7 +630,7 @@ class Trainer():
                 print(f"Deleted old checkpoint: {oldest}")
 
 
-    def _test_seq_acc(self, load_best=True, epochs=None):
+    def _test_seq_acc(self, load_best=True, epochs=None, on_all=False):
         """
         Test sequence accuracy and log the results.
 
@@ -465,7 +639,7 @@ class Trainer():
             epochs (int or None): Epoch for labeling/testing metadata.
         """
         test_accuracy_seq = sequence_accuracy(
-            self.config, self.valid_ds, self.tgt_vocab, load_best, epochs
+            self.config, self.valid_ds, self.tgt_vocab, load_best, epochs, on_all
         )
         self.run.log({
             'test/acc': test_accuracy_seq,
@@ -478,7 +652,7 @@ class Trainer():
         """
         Train the model across all epochs.
         """
-    
+
         self.run.define_metric("global_step")
         self.run.define_metric("validation/*", step_metric="global_step")
         self.run.define_metric("train/*", step_metric="global_step")
@@ -496,7 +670,7 @@ class Trainer():
             # if self.global_step >= self.warmup_steps and not self.is_constant_lr:
             #     self.lr_scheduler.step(self.current_epoch)
 
-            
+
             self.run.log({
                 'valid/loss': valid_loss,
                 'global_step': self.global_step
@@ -508,10 +682,10 @@ class Trainer():
             if self.is_master:
                 if valid_loss <= self.best_val_loss:
                     self.best_val_loss = valid_loss
-                    self._save_model(f"{self.config.model_name}_best.pth")
+                    self._save_model(f"{self.config.model_name}/best.pth")
 
-                if self.save_freq and (self.current_epoch + 1) % self.save_freq == 0:
-                    self._save_model(f"{self.config.model_name}_ep{self.current_epoch + 1}.pth")
+                if self.save_freq and (self.current_epoch + 1) % self.save_freq == 0 :
+                    self._save_model(f"{self.config.model_name}/ep{self.current_epoch + 1}.pth")
                     self._test_seq_acc(load_best=False, epochs=self.current_epoch)
 
                 elif (self.current_epoch + 1) % self.test_freq == 0:
@@ -522,12 +696,12 @@ class Trainer():
             print(
                 f"Epoch {self.current_epoch + 1}/{self.config.epochs}, "
                 f"Training Loss: {training_loss:.4f}, "
-                f"Validation Loss: {valid_loss:.4f}"
+                f"Validation Loss: {valid_loss:.4f}\n"
             )
 
         if self.is_master:
             if self.save_last:
                 self._save_model(f"{self.config.model_name}_ep{self.current_epoch + 1}.pth")
-            self._test_seq_acc(load_best=False, epochs=self.current_epoch)
+            self._test_seq_acc(load_best=True, epochs=self.current_epoch, on_all=True)
 
         wandb.finish()

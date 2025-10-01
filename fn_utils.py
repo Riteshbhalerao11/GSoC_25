@@ -18,7 +18,7 @@ from .constants import BOS_IDX, EOS_IDX, PAD_IDX, SPECIAL_SYMBOLS, UNK_IDX, SEP_
 from .tokenizer import Tokenizer, Vocab
 from .logger import get_logger
 
-logger = get_logger(__name__) 
+logger = get_logger(__name__)
 
 def create_tokenizer(df, config):
     """Creates a tokenizer and builds source and target vocabularies.
@@ -102,8 +102,8 @@ def collate_fn(batch: list) -> tuple:
     """
     src_batch = [src for src, _ in batch]
     tgt_batch = [tgt for _, tgt in batch]
-    src_batch = pad_sequence(src_batch, padding_value=PAD_IDX, batch_first=True)
-    tgt_batch = pad_sequence(tgt_batch, padding_value=PAD_IDX, batch_first=True)
+    src_batch = pad_sequence(src_batch, padding_value=PAD_IDX, batch_first=True, padding_side='right')
+    tgt_batch = pad_sequence(tgt_batch, padding_value=PAD_IDX, batch_first=True, padding_side='right')
     return src_batch, tgt_batch
 
 
@@ -133,7 +133,7 @@ def calculate_line_params(point1, point2):
 # def init_transformer_weights(module, is_mamba):
 
 #     if is_mamba and isinstance(module, MixerModel):
-#         return  
+#         return
 
 #     if isinstance(module, nn.Linear):
 #         nn.init.xavier_normal_(module.weight, gain=nn.init.calculate_gain('relu'))
@@ -158,7 +158,7 @@ def get_model(config):
         Model: Initialized Transformer model.
     """
     model = construct_model(config)
-    
+
     # model = Model(
     #     config.num_encoder_layers,
     #     config.num_decoder_layers,
@@ -176,10 +176,10 @@ def get_model(config):
     # )
 
     # model.apply(lambda m: init_transformer_weights(m, config.is_mamba))
-    
+
     # logger.info("Weights initialized")
-    
-    logger.info(str(model)) 
+
+    logger.info(str(model))
 
     return model
 
@@ -213,6 +213,10 @@ def parse_args():
     parser.add_argument("--nhead", type=int, required=True, help="Number of attention heads")
     parser.add_argument("--num_encoder_layers", type=int, required=True, help="Number of encoder layers")
     parser.add_argument("--num_decoder_layers", type=int, required=True, help="Number of decoder layers")
+    parser.add_argument("--no_attn", action="store_true", help="Do not use Attention Layers at all")
+    parser.add_argument("--lm_head", action="store_true", help="Use MambaLMHead")
+    parser.add_argument("--vanilla_transformer", action="store_true", help="Use Vanilla Transformer")
+    # parser.add_argument("--not_ssm", action="store_true", help="Use SSM layers")
     # parser.add_argument("--is_pre_norm", action="store_true", help="Location of normalization layers")
     # parser.add_argument('--kan_ff_dims', type=parse_ff_dims, help='KAN layer sizes (comma-separated)')
     # parser.add_argument("--is_kan", action="store_true", help="Use KAN layers")
@@ -300,10 +304,14 @@ def create_config_from_args(args):
 
         # Model architecture
         embedding_size=args.embedding_size,
-        ff_dims=args.ff_dims,  
+        ff_dims=args.ff_dims,
         nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers,
         num_decoder_layers=args.num_decoder_layers,
+        # no_attn=args.no_attn,
+        lm_head=args.lm_head,
+        vanilla_transformer=args.vanilla_transformer,
+        # not_ssm=args.not_ssm,
         # is_pre_norm=args.is_pre_norm,
         # kan_ff_dims=args.kan_ff_dims,
         # is_kan=args.is_kan,

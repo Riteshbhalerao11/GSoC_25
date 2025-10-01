@@ -38,7 +38,7 @@ if __name__ == '__main__':
     args = parse_args()
     config = create_config_from_args(args)
     config.world_size = int(os.environ['WORLD_SIZE'])
-    config.optimizer_lr *= config.world_size
+    # config.optimizer_lr *= config.world_size
 
     init_distributed_mode(config)
 
@@ -60,6 +60,8 @@ if __name__ == '__main__':
         # df_train = df_train.sample(1000).reset_index(drop=True)
 
     logger.info(f"TRAIN SAMPLES: {df_train.shape}")
+    logger.info(f"VALID SAMPLES: {df_valid.shape}")
+    logger.info(f"TEST SAMPLES: {df_test.shape}")
     logger.info("Data loading complete")
 
     main(config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab)

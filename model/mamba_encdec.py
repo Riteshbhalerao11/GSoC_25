@@ -8,16 +8,15 @@ from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.utils.generation import InferenceParams
 
 
-# from utils.beam_search import BeamSearch
+
 import json
-# from utils.mt.comet import load_comet
-from transformers.optimization import get_inverse_sqrt_schedule
-# from transformers import PreTrainedTokenizerFast
 import evaluate
 
-
 from .helpers.flash_cross_attention import FlashCrossAttentionWrapper
-from .helpers.cross_attention import CrossAttentionWrapper
+from .helpers.flash_self_attention import FlashSelfAttentionWrapper
+
+from .helpers.sliding_attention import SlidingAttentionWrapper
+# from .helpers.cross_attention import CrossAttentionWrapper
 from .helpers.ffn import FeedForwardWrapper
 from .helpers.mamba import MambaDecoder, MixerModel
 
@@ -35,10 +34,6 @@ class MambaEncDec(nn.Module):
             "rms_norm": True,
             "fused_add_norm": True,
             "use_fast_path": False,
-            # "learning_rate": 7e-4,
-            # "warmup_steps": 4000,
-            # "weight_decay": 0.001,
-            # "devices": 'cuda:0'
         }
     }
 
@@ -51,6 +46,8 @@ class MambaEncDec(nn.Module):
         d_model=None,
         dec_n_layer=None,
         enc_n_layer=None,
+        encoder_layer_list=None,
+        decoder_layer_list=None,
         rms_norm=None,
         fused_add_norm=None,
         use_fast_path=None,
@@ -71,9 +68,20 @@ class MambaEncDec(nn.Module):
             rms_norm=rms_norm,
             fused_add_norm=fused_add_norm,
             # use_fast_path=use_fast_path,
-            ssm_cfg={"dropout": dropout},
+            ssm_cfg={"dropout": 0.1},
         )
+        
+        module_mapping = {
+            'FFN':FeedForwardWrapper,
+            'FMHSA':FlashSelfAttentionWrapper,
+            'FXA':FlashCrossAttentionWrapper,
+            'FSWA':SlidingAttentionWrapper,
+        }
 
+        module_names = list(module_mapping.keys())
+
+        encoder_layer_dict = dict([(i, module_mapping[_]) for i, _ in enumerate(encoder_layer_list) if _ in module_names])
+        # print(encoder_layer_dict)
         self.encoder = MixerModel(
             vocab_size=src_vocab_size,
             d_model=d_model,
@@ -81,26 +89,39 @@ class MambaEncDec(nn.Module):
             rms_norm=rms_norm,
             fused_add_norm=fused_add_norm,
             use_fast_path=use_fast_path,
-            ssm_cfg={"dropout": dropout},
-            layer_dict={},
+            ssm_cfg={"dropout": 0.1},
+            layer_dict=encoder_layer_dict,
         )
 
-        self.layers = (0, 3, 6, 9, 12, 15)
-        x_attention_layers = [
-            (i, FlashCrossAttentionWrapper) for i in (1, 4, 7, 10, 13, 16)
-        ]
-        ffn_layers = [(i, FeedForwardWrapper) for i in (2, 5, 8, 11, 14, 17)]
+        decoder_layer_dict = dict([(i, module_mapping[_]) for i, _ in enumerate(decoder_layer_list) if _ in module_names])
+        # self.dec_blocks = [MixerModel, FlashCrossAttentionWrapper, FeedForwardWrapper] * dec_n_layer
 
-        layer_dict = dict(x_attention_layers + ffn_layers)
+        # self.layers = [i for i in range(len(self.dec_blocks)) if i==MixerModel]
+
+        
+        # self.layers = (0, 3, 6, 9, 12, 15)
+        # # layer_dict = dict([(i,_) for i,_ in enumerate(self.dec_blocks) if _ != MixerModel])
+        # x_attention_layers = [
+        #     (i, FlashCrossAttentionWrapper) for i in (1, 4, 7, 10, 13, 16)
+        # ]
+        # ffn_layers = [(i, FeedForwardWrapper) for i in (2, 5, 8, 11, 14, 17)]
+        # self.layers = (2, 3, 6, 9, 12, 15)
+        # self.layers = (2, 3, 6, 7, 8, 9, 10)
+        # # layer_dict = dict([(i,_) for i,_ in enumerate(self.dec_blocks) if _ != MixerModel])
+        # x_attention_layers = [
+        #     (i, FlashCrossAttentionWrapper) for i in (0,4)
+        # ]
+        # ffn_layers = [(i, FeedForwardWrapper) for i in (1,5)]
+        # layer_dict = dict(x_attention_layers + ffn_layers)
+        # layer_dict = dict(ffn_layers)
+        # layer_dict = {}
 
         self.decoder = MambaDecoder(
             config=self.config,
-            layer_dict=layer_dict,
+            layer_dict=decoder_layer_dict,
             layer_kwargs={"dropout":0.1}
         )
         self.generator = self.decoder.generator
-        # self.tokenizer = tokenizer
-        self.bleu = evaluate.load("sacrebleu")
         self.config = config
         self.use_padding = use_padding
         dtype_map = {
@@ -134,6 +155,7 @@ class MambaEncDec(nn.Module):
         
         b, l = source_attention_mask.shape
         # source_attention_mask = source_attention_mask.reshape(b,l).to(torch.bool)
+
         source_attention_mask = source_attention_mask.to(torch.bool)
         target_attention_mask = target_attention_mask.to(torch.bool)
 
@@ -142,6 +164,7 @@ class MambaEncDec(nn.Module):
             mask=source_attention_mask,
         )
         # print(source_vec.dtype, source_attention_mask.dtype)
+
         cache = self.allocate_inference_cache(
             batch_size=b,
             max_seqlen=300 + l + 1,  # source + BOS
@@ -160,6 +183,7 @@ class MambaEncDec(nn.Module):
         # print(source_attention_mask.type(), target_attention_mask.type())
         # print(position_ids.type())
         # print(num_last_tokens)
+
         out = self.decoder.forward(
             input_ids,
             context=source_vec,
@@ -181,14 +205,15 @@ class MambaEncDec(nn.Module):
 
     def decode(self, ys, memory, target_attention_mask, source_attention_mask):
         b, l = source_attention_mask.shape
+        _, tl = target_attention_mask.shape
         cache = self.allocate_inference_cache(
             batch_size=b,
-            max_seqlen=300 + l + 1,  # source + BOS
+            max_seqlen=tl + l + 1,  # source + BOS
             dtype=self.precision,
         )
 
         inference_params = InferenceParams(
-            max_seqlen=300 + l + 1,
+            max_seqlen=tl + l + 1,
             max_batch_size=b,
             key_value_memory_dict=cache,
         )
@@ -202,9 +227,10 @@ class MambaEncDec(nn.Module):
                 inference_params=inference_params,
                 num_last_tokens=1,
         )
+
         return out
     
-    # def generator(self, logits):
+
 
     # def decode(self,)
     # def test_step(self, batch, batch_idx):
@@ -298,9 +324,7 @@ class MambaEncDec(nn.Module):
         
     #     # tpreds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
     #     # tlabels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-    #     # bleu_score = self.bleu.compute(predictions=tpreds, references=tlabels)["score"]
 
-    #     # self.log("val_bleu", bleu_score, sync_dist=True)
     #     preds = preds.cpu()
     #     labels = labels.cpu()
         
@@ -411,41 +435,7 @@ class MambaEncDec(nn.Module):
         # tlabels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
 
         # return seqs, labels
-        # bleu_score = self.bleu.compute(predictions=tpreds, references=tlabels)["score"]
-        # self.log("test_bleu", bleu_score, sync_dist=True)
 
-        # res = self.comet.compute(
-        #     sources=tsrcs,
-        #     predictions=tpreds,
-        #     references=tlabels,
-        #     devices=self.config["devices"],
-        #     progress_bar=False,
-        # )
-
-        # self.log("test_comet", res["mean_score"], sync_dist=True)
-
-        # if self.test_per_sample:
-        #     bleu_scores = [
-        #         self.bleu.compute(predictions=[tpreds[i]], references=[tlabels[i]])[
-        #             "score"
-        #         ]
-        #         for i in range(batch_size)
-        #     ]
-        #     self.test_res.append((tsrcs, tpreds, tlabels, bleu_scores, res["scores"]))
-
-        # print(f"bleu: {bleu_score}, comet: {res['mean_score']}")
-    #     return bleu_score, res["mean_score"]
-
-    # def on_test_epoch_end(self):
-    #     # if self.test_per_sample:
-    #     if False:
-    #         source, target = self.config["language_pair"]
-
-    #         with open(
-    #             f"mt/res/{self.config['dataset']}/{self.config['dataset']}-{source}-{target}-{self.model_name}-{self.test_suffix}.json",
-    #             "w",
-    #         ) as f:
-    #             json.dump(self.test_res, f)
 # def training_step(self, batch, batch_idx):
     #     # source, target, source_attention_mask = (
     #     #     batch["input_ids"],
@@ -519,21 +509,3 @@ class MambaEncDec(nn.Module):
                 cache[layer_idx][1].index_select(0, beam_idx.to(device)),
             )
         return cache
-
-    # def configure_optimizers(self):
-    #     optimizer = torch.optim.AdamW(
-    #         self.parameters(),
-    #         lr=self.config["learning_rate"],
-    #         weight_decay=self.config["weight_decay"],
-    #         fused=True,
-    #     )
-
-    #     scheduler = {
-    #         "scheduler": get_inverse_sqrt_schedule(
-    #             optimizer,
-    #             num_warmup_steps=self.config["warmup_steps"],
-    #         ),
-    #         "interval": "step",
-    #     }
-
-    #     return {"optimizer": optimizer, "lr_scheduler": scheduler}

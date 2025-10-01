@@ -1,0 +1,29 @@
+project_name: EW
+run_name: EW_2_2_e512_d512
+model_name: EW_2_2_e512_d512
+root_dir: /pscratch/sd/p/pr4santh/results/symba
+data_dir: /pscratch/sd/p/pr4santh/Data/permutation_free/EW-2-to-2/
+device: cuda
+epochs: 50
+training_batch_size: 128
+valid_batch_size: 128
+num_workers: 128
+embedding_size: 512
+ff_dims: 4096
+nhead: 8
+num_encoder_layers: 5
+num_decoder_layers: 5
+warmup_ratio: 0.1
+dropout: 0.2
+weight_decay: 1e-4
+optimizer_lr: 1e-3
+src_max_len: 512
+tgt_max_len: 512
+curr_epoch: 0
+save_last: true
+filter_len: true
+save_freq: 5
+to_replace: true
+index_pool_size: 1024
+# truncate: true
+# debug: true

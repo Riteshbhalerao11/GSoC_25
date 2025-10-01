@@ -29,7 +29,9 @@ class ModelConfig:
     ff_dims: int
     # is_kan: bool
     # is_pre_norm: bool
-    
+    lm_head: bool
+    vanilla_transformer: bool
+
     # Optimization & Regularization
     warmup_ratio: float
     dropout: float
@@ -106,7 +108,7 @@ class ModelTestConfig:
     # is_pre_norm: bool
 
 
-    
+
     # FFN dims
     ff_dims: int
 
@@ -117,7 +119,7 @@ class ModelTestConfig:
     src_max_len: int
     tgt_max_len: int
     is_termwise: bool
-    
+
     kan_grid_size:Optional[int] = 8
 
     # Size of vocabulary for source and target sequences
@@ -132,7 +134,7 @@ class ModelTestConfig:
 
     # if debug
     debug: Optional[bool] = False
-    
+
     #to replace index and momentum
     to_replace: bool = False
 
@@ -140,6 +142,6 @@ class ModelTestConfig:
     index_pool_size : int = 100
 
     dtype: Optional[str] = 'bfloat16'
-    
+
     def to_dict(self):
         return asdict(self)
