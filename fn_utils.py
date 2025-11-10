@@ -3,6 +3,7 @@ import random
 from datetime import timedelta
 from typing import List
 
+import editdistance
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -11,6 +12,7 @@ from torch.nn.utils.rnn import pad_sequence
 from .config import ModelConfig
 from .model.model import Model
 from .model.sinekan import SineKANLayer
+
 
 from .constants import BOS_IDX, EOS_IDX, PAD_IDX, SPECIAL_SYMBOLS, UNK_IDX, SEP_IDX, T_IDX
 from .tokenizer import Tokenizer, Vocab
@@ -88,6 +90,33 @@ def decode_sequence(toks: List[int], vocab):
     """
     return ''.join(vocab.decode(toks,include_special_tokens=False))
 
+def edit_distance(preds, refs, special_symbols):
+    """
+    Computes normalized edit distance rewards by ignoring special symbols.
+
+    Args:
+        preds: list of list of predicted tokens
+        refs: list of list of reference tokens 
+        special_symbols: set of tokens to ignore 
+
+    Returns:
+        rewards: list of float, where reward = 1 - (edit_distance / max(len))
+    """
+    rewards = []
+    preds = preds.tolist() if isinstance(preds, torch.Tensor) else preds
+    refs = refs.tolist() if isinstance(refs, torch.Tensor) else refs
+    for pred, ref in zip(preds, refs):
+        pred_clean = [tok for tok in pred if tok not in special_symbols]
+        ref_clean = [tok for tok in ref if tok not in special_symbols]
+        # print(pred_clean)
+        # print(ref_clean)
+        dist = editdistance.eval(pred_clean, ref_clean)
+        # norm = max(len(pred_clean), len(ref_clean)) if max(len(pred_clean), len(ref_clean)) > 0 else 1
+        # reward = 1.0 - (dist / norm)
+        # print(dist)
+        rewards.append(-1 * dist)
+    return rewards
+
 
 def collate_fn(batch: list) -> tuple:
     """Collates a batch of (src, tgt) pairs into padded tensors.
@@ -131,6 +160,8 @@ def calculate_line_params(point1, point2):
 def init_transformer_weights(module, is_kan):
 
     if is_kan and isinstance(module, SineKANLayer):
+        # nn.init.xavier_normal_(module.amplitudes, gain=nn.init.calculate_gain('relu'))
+        # nn.init.xavier_normal_(module.freq, gain=nn.init.calculate_gain('relu'))
         return  
 
     if isinstance(module, nn.Linear):
@@ -164,12 +195,15 @@ def get_model(config):
         config.src_voc_size,
         config.tgt_voc_size,
         config.ff_dims,
+        config.use_torch_mha,
         config.dropout,
         config.is_pre_norm,
         config.is_kan,
+        config.is_kan_embed,
         config.kan_ff_dims,
         config.kan_grid_size,
-        config.device
+        config.device,
+        
     )
 
     model.apply(lambda m: init_transformer_weights(m, config.is_kan))
@@ -200,8 +234,10 @@ def parse_args():
     # Device & training setup
     parser.add_argument("--device", type=str, default="cuda", help='Device: "cuda" or "cpu"')
     parser.add_argument("--epochs", type=int, required=True, help="Total number of epochs")
+    parser.add_argument("--finetune", action="store_true", help="Finetuning or not")
     parser.add_argument("--training_batch_size", type=int, required=True, help="Batch size for training")
     parser.add_argument("--valid_batch_size", type=int, required=True, help="Batch size for validation")
+    parser.add_argument("--test_batch_size", type=int, default=None, help="Batch size for testing (defaults to valid_batch_size)")
     parser.add_argument("--num_workers", type=int, required=True, help="Number of data loader workers")
 
     # Model architecture
@@ -213,7 +249,9 @@ def parse_args():
     parser.add_argument("--is_pre_norm", action="store_true", help="Location of normalization layers")
     parser.add_argument('--kan_ff_dims', type=parse_ff_dims, help='KAN layer sizes (comma-separated)')
     parser.add_argument("--is_kan", action="store_true", help="Use KAN layers")
+    parser.add_argument("--is_kan_embed", action="store_true", help="Use KAN embedding")
     parser.add_argument("--kan_grid_size", type=int, default=8, help="KAN grid size")
+    parser.add_argument("--use_torch_mha", action="store_true", help="Use PyTorch's built-in MHA")
 
     # Optimization settings
     parser.add_argument("--warmup_ratio", type=float, required=True, help="Warmup ratio for learning rate")
@@ -225,7 +263,11 @@ def parse_args():
     # Sequence settings
     parser.add_argument("--src_max_len", type=int, required=True, help="Max source sequence length")
     parser.add_argument("--tgt_max_len", type=int, required=True, help="Max target sequence length")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0 for greedy)")
+    parser.add_argument("--sample_freq", type=int, default=5, help="Sampling frequency for SCST")
     parser.add_argument("--is_termwise", action="store_true", help="Termwise dataset")
+    parser.add_argument("--is_beamsearch", action="store_true", help="Whether to use beam search decoding")
+    parser.add_argument("--beam_width", type=int, default=5, help="Beam width for beam search decoding")
 
     # Training state
     parser.add_argument("--curr_epoch", type=int, required=True, help="Current epoch (for resuming)")
@@ -259,6 +301,7 @@ def parse_args():
     parser.add_argument("--clip_grad_norm", type=float, default=-1, help="Gradient clipping threshold (-1 to disable)")
     parser.add_argument("--log_freq", type=int, default=50, help="Logging frequency (steps)")
     parser.add_argument("--test_freq", type=int, default=10, help="Testing frequency (steps)")
+    parser.add_argument("--test_size", type=int, default=1000, help="Testing size")
     parser.add_argument("--truncate", action="store_true", help="Truncate sequences")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 
@@ -271,6 +314,9 @@ def parse_args():
     # Post-parse validation
     if args.is_kan and args.kan_ff_dims is None:
         parser.error("--kan_ff_dims is required when --is_kan is set.")
+    
+    if args.test_batch_size is None:
+        args.test_batch_size = args.valid_batch_size
 
     return args
 
@@ -290,8 +336,10 @@ def create_config_from_args(args):
         # Device & training setup
         device=args.device,
         epochs=args.epochs,
+        finetune=args.finetune,
         training_batch_size=args.training_batch_size,
         valid_batch_size=args.valid_batch_size,
+        test_batch_size=args.test_batch_size,
         num_workers=args.num_workers,
 
         # Model architecture
@@ -303,7 +351,9 @@ def create_config_from_args(args):
         is_pre_norm=args.is_pre_norm,
         kan_ff_dims=args.kan_ff_dims,
         is_kan=args.is_kan,
+        is_kan_embed=args.is_kan_embed,
         kan_grid_size=args.kan_grid_size,
+        use_torch_mha=args.use_torch_mha,
 
         # Optimization settings
         warmup_ratio=args.warmup_ratio,
@@ -315,7 +365,11 @@ def create_config_from_args(args):
         # Sequence settings
         src_max_len=args.src_max_len,
         tgt_max_len=args.tgt_max_len,
+        temperature=args.temperature,
+        sample_freq=args.sample_freq,
         is_termwise=args.is_termwise,
+        is_beamsearch=args.is_beamsearch,
+        beam_width=args.beam_width,
 
         # Training state
         curr_epoch=args.curr_epoch,
@@ -348,6 +402,7 @@ def create_config_from_args(args):
         clip_grad_norm=args.clip_grad_norm,
         log_freq=args.log_freq,
         test_freq=args.test_freq,
+        test_size=args.test_size,
         truncate=args.truncate,
         debug=args.debug,
 

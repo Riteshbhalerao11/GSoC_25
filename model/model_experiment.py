@@ -1,3 +1,6 @@
+import sys
+sys.path.insert(0, '/pscratch/sd/r/ritesh11/rational_kat_cu')
+
 from flash_attn.bert_padding import unpad_input, pad_input
 from flash_attn import flash_attn_varlen_qkvpacked_func,flash_attn_varlen_kvpacked_func
 import torch
@@ -7,8 +10,52 @@ import copy
 
 from .sinekan import KANFeedForwardBlock
 from .utils import TokenEmbedding, PositionalEncoding
+from timm.models.layers import to_2tuple
+from functools import partial
+from kat_rational import KAT_Group
 
 
+class KAN(nn.Module):
+    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
+    """
+    def __init__(
+            self,
+            in_features,
+            hidden_features=None,
+            out_features=None,
+            norm_layer=None,
+            bias=True,
+            drop=0.,
+            use_conv=False,
+            act_init="gelu",
+            device=None
+    ):
+        super().__init__()
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        bias = to_2tuple(bias)
+        drop_probs = to_2tuple(drop)
+        linear_layer = partial(nn.Conv2d, kernel_size=1) if use_conv else nn.Linear
+
+        self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0])
+        self.act1 = KAT_Group(mode="identity", device=device)
+        self.drop1 = nn.Dropout(drop_probs[0])
+        self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
+        self.act2 = KAT_Group(mode=act_init, device=device)
+        self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1])
+        self.drop2 = nn.Dropout(drop_probs[1])
+
+    def forward(self, x):
+        x = self.act1(x)
+        x = self.drop1(x)
+        x = self.fc1(x)
+        x = self.act2(x)
+        x = self.drop2(x)
+        x = self.fc2(x)
+        return x
+    
 class FlashMHA(nn.Module):
     """
     Multi-Head Attention module using FlashAttention or PyTorch's native MultiheadAttention.
@@ -132,6 +179,7 @@ class TransformerEncoderLayer(nn.Module):
         embed_size: int,
         nhead: int,
         dim_feedforward: int = 2048,
+        is_kan: bool = False,
         dropout: float = 0.1,
         activation: nn.Module = torch.nn.functional.gelu,
         layer_norm_eps: float = 1e-5,
@@ -144,6 +192,9 @@ class TransformerEncoderLayer(nn.Module):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
 
+        self.is_kan = is_kan
+
+        # Multi-head attention
         self.self_attn = FlashMHA(
             embed_size,
             nhead,
@@ -152,15 +203,27 @@ class TransformerEncoderLayer(nn.Module):
             **factory_kwargs
         )
 
-        self.linear1 = nn.Linear(embed_size, dim_feedforward, bias=bias, **factory_kwargs)
-        self.linear2 = nn.Linear(dim_feedforward, embed_size, bias=bias, **factory_kwargs)
+        # Feedforward: KAN or vanilla MLP
+        if self.is_kan:
+            self.kan_ff = KAN(
+                in_features=embed_size,
+                hidden_features=dim_feedforward,
+                out_features=embed_size,
+                drop=dropout,
+                device=device
+            )
+        else:
+            self.linear1 = nn.Linear(embed_size, dim_feedforward, bias=bias, **factory_kwargs)
+            self.linear2 = nn.Linear(dim_feedforward, embed_size, bias=bias, **factory_kwargs)
+            self.dropout = nn.Dropout(dropout)
 
+        # Norms
         self.norm1 = nn.LayerNorm(embed_size, eps=layer_norm_eps, bias=bias, **factory_kwargs)
         self.norm2 = nn.LayerNorm(embed_size, eps=layer_norm_eps, bias=bias, **factory_kwargs)
 
+        # Dropouts
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-        self.dropout = nn.Dropout(dropout)
 
         self.activation = activation
         self.norm_first = norm_first
@@ -170,8 +233,12 @@ class TransformerEncoderLayer(nn.Module):
         return self.dropout1(x)
 
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        return self.dropout2(x)
+        if self.is_kan:
+            x = self.kan_ff(x)
+            return x
+        else:
+            x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+            return self.dropout2(x)
 
     def forward(
         self,
@@ -188,10 +255,10 @@ class TransformerEncoderLayer(nn.Module):
         x = src
         if self.norm_first:
             x = x + self._sa_block(self.norm1(x), src_pad_mask, is_causal)
-            x = x + self._ff_block(self.norm2(x))
+            x = self._ff_block(self.norm2(x)) if self.is_kan else x + self._ff_block(self.norm2(x))
         else:
             x = self.norm1(x + self._sa_block(x, src_pad_mask, is_causal))
-            x = self.norm2(x + self._ff_block(x))
+            x = self.norm2(self._ff_block(x)) if self.is_kan else self.norm2(x + self._ff_block(x))
         return x
 
 
@@ -222,7 +289,8 @@ class TransformerDecoderLayer(nn.Module):
         self.cross_attn = FlashMHA(embed_size, nhead, use_torch_mha=use_torch_mha,  dropout=dropout, **factory_kwargs)
 
         if self.is_kan:
-            self.kan_ff = KANFeedForwardBlock(embed_size, kan_ff_dims, grid_size=kan_grid_size, device=device)
+            self.kan_ff = KAN(in_features=embed_size, out_features=embed_size, hidden_features=dim_feedforward,
+                              drop=dropout, device=device)
         else:
             self.linear1 = nn.Linear(embed_size, dim_feedforward, bias=bias, **factory_kwargs)
             self.linear2 = nn.Linear(dim_feedforward, embed_size, bias=bias, **factory_kwargs)
@@ -230,12 +298,7 @@ class TransformerDecoderLayer(nn.Module):
 
         self.norm1 = nn.LayerNorm(embed_size, eps=layer_norm_eps, bias=bias, **factory_kwargs)
         self.norm2 = nn.LayerNorm(embed_size, eps=layer_norm_eps, bias=bias, **factory_kwargs)
-
-        if self.is_kan and not norm_first:
-            # self.norm3 = nn.LayerNorm(kan_ff_dims[-1], eps=layer_norm_eps, bias=bias, **factory_kwargs)
-            self.norm3 = None
-        else:
-            self.norm3 = nn.LayerNorm(embed_size, eps=layer_norm_eps, bias=bias, **factory_kwargs)
+        self.norm3 = nn.LayerNorm(embed_size, eps=layer_norm_eps, bias=bias, **factory_kwargs)
 
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
@@ -292,8 +355,7 @@ class TransformerDecoderLayer(nn.Module):
         else:
             x = self.norm1(x + self._sa_block(x, tgt_padding_mask, tgt_is_causal))
             x = self.norm2(x + self._cross_attn_block(x, memory, memory_padding_mask, memory_is_causal))
-            # x = self.norm3(self._ff_block(x)) if self.is_kan else self.norm3(x + self._ff_block(x))
-            x = self._ff_block(x) if self.is_kan else self.norm3(x + self._ff_block(x))
+            x = self.norm3(self._ff_block(x)) if self.is_kan else self.norm3(x + self._ff_block(x))
 
         return x
 
@@ -312,19 +374,11 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    """Stack of Transformer decoder layers with optional KAN layer."""
+    """Stack of Transformer decoder layers."""
 
-    def __init__(self, decoder_layer: nn.Module, decoder_kan_layer: Optional[nn.Module], num_layers: int):
+    def __init__(self, decoder_layer: nn.Module, num_layers: int):
         super().__init__()
-        self.layers = nn.ModuleList()
-
-        if decoder_kan_layer is not None:
-            num_layers -= 1
-
-        self.layers.extend([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
-
-        if decoder_kan_layer is not None:
-            self.layers.append(decoder_kan_layer)
+        self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
 
     def forward(
         self,
@@ -372,10 +426,12 @@ class Transformer(nn.Module):
     ):
         super().__init__()
 
+        # encoder
         encoder_layer = TransformerEncoderLayer(
             embed_size,
             nhead,
             dim_feedforward=dim_feedforward,
+            is_kan=is_kan,                        
             use_torch_mha=use_torch_mha,
             dropout=dropout,
             activation=activation,
@@ -383,14 +439,16 @@ class Transformer(nn.Module):
             norm_first=norm_first,
             bias=bias,
             device=device,
-            dtype=dtype
+            dtype=dtype,
         )
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers)
 
+        # decoder
         decoder_layer = TransformerDecoderLayer(
             embed_size,
             nhead,
             dim_feedforward=dim_feedforward,
+            is_kan=is_kan,                      
             use_torch_mha=use_torch_mha,
             dropout=dropout,
             activation=activation,
@@ -398,34 +456,9 @@ class Transformer(nn.Module):
             norm_first=norm_first,
             bias=bias,
             device=device,
-            dtype=dtype
+            dtype=dtype,
         )
-
-        decoder_kan_layer = None
-        if is_kan:
-            if kan_grid_size is None or kan_grid_size <= 0:
-                raise ValueError("kan_grid_size must be a positive integer when is_kan is True")
-            if kan_ff_dims is None:
-                raise ValueError("kan_ff_dims is required when is_kan is True")
-
-            decoder_kan_layer = TransformerDecoderLayer(
-                embed_size,
-                nhead,
-                dim_feedforward=dim_feedforward,
-                is_kan=True,
-                kan_ff_dims=kan_ff_dims,
-                kan_grid_size=kan_grid_size,
-                dropout=dropout,
-                use_torch_mha=use_torch_mha,
-                activation=activation,
-                layer_norm_eps=layer_norm_eps,
-                norm_first=norm_first,
-                bias=bias,
-                device=device,
-                dtype=dtype
-            )
-
-        self.decoder = TransformerDecoder(decoder_layer, decoder_kan_layer, num_decoder_layers)
+        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers)
 
     def forward(
         self,
@@ -506,7 +539,7 @@ class Model(nn.Module):
             dtype=dtype
         )
 
-        self.generator = nn.Linear(kan_ff_dims[-1] if is_kan else embed_size, tgt_vocab_size)
+        self.generator = nn.Linear(embed_size, tgt_vocab_size)
 
         self.src_tok_emb = TokenEmbedding(src_vocab_size, embed_size)
         self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, embed_size)

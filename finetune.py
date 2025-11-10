@@ -8,18 +8,19 @@ from torch.amp import GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from .inference import greedy_decode
 from .predictor import sequence_accuracy
 from .fn_utils import (
     calculate_line_params,
     collate_fn,
-    create_mask,
-    get_model
+    get_model,
+    edit_distance
 )
 from .data import Data
-from .constants import PAD_IDX
+from .constants import PAD_IDX, SPECIAL_SYMBOLS
 
 
-class Trainer():
+class SCSTrainer():
     """
     Class for training a sequence-to-sequence model.
 
@@ -41,10 +42,9 @@ class Trainer():
         is_master (bool): Flag indicating if this is the master (rank 0) process.
         run (wandb.Run): Weights & Biases run object (only initialized on master).
         dataloaders (dict): Dictionary containing train, validation, and test dataloaders.
-        valid_ds (Dataset): Preprocessed valid dataset.
         warmup_steps (int): Number of warmup steps for learning rate scheduling.
         ep_steps (int): Number of steps per epoch.
-        root_dir (str): Directory where checkpoints are saved.
+        finetune_dir (str): Directory where checkpoints are saved.
         current_epoch (int): The current epoch number.
         best_val_loss (float): Best validation loss observed.
         train_loss_list (list): List of training losses over epochs.
@@ -66,11 +66,11 @@ class Trainer():
     """
 
 
-    def __init__(self, config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab):
+    def __init__(self, config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab, finetune_dir):
         
         self.scaler = GradScaler()
         self.is_constant_lr = config.is_constant_lr
-        
+
         if config.dtype == 'bfloat16':
             self.dtype = torch.bfloat16
         elif config.dtype == 'float32':
@@ -88,20 +88,22 @@ class Trainer():
         self.device = self.local_rank
         self.config = config
         self.is_master = self.local_rank == 0
+        self.finetune_dir = finetune_dir
 
         # Initialize Weights & Biases
                  
-        os.makedirs(config.root_dir, exist_ok=True)
+        os.makedirs(self.finetune_dir, exist_ok=True)
 
         wandb.login()
+
         self.run = wandb.init(
-            project=config.project_name,
+            project=config.project_name + "_finetune",
             name=f"{config.run_name}_rank{self.global_rank}",
             group=config.run_name,
-            dir=config.root_dir,
+            dir=self.finetune_dir,
             config=config.to_dict(),
             resume='allow',
-            id=config.run_id
+            id=config.run_id,
         )
         
         # Initialize dataloaders
@@ -112,13 +114,14 @@ class Trainer():
         self.total_steps = self.ep_steps * config.epochs
         self.warmup_steps = int(config.warmup_ratio * self.total_steps)
 
+        self.finetune_dir = self.finetune_dir
         self.root_dir = config.root_dir
         self.current_epoch = config.curr_epoch
         
         # Training and valid loss lists
-        self.best_val_loss = 1e6
+        self.best_acc = 0
         self.train_loss_list = []
-        self.valid_loss_list = []
+        self.test_acc_list = []
         
         # Initialize model, optimizer, and schedulers
         self.model, self.ddp_model = self._prepare_model()
@@ -132,23 +135,58 @@ class Trainer():
         self.lr = config.update_lr
         self.global_step = 0
         self.tgt_vocab = tgt_vocab 
-        
-        self.ckp_paths = [file for file in os.listdir(config.root_dir) if ('best' not in file and config.model_name in file)]
+        self.special_symbols = set(tgt_vocab.encode(SPECIAL_SYMBOLS))
+                
+        self.ckp_paths = [file for file in os.listdir(self.finetune_dir) if ('best' not in file and config.model_name in file)]
         self.save_limit = config.save_limit
 
-    def criterion(self, y_pred, y_true):
+    def _get_rewards(self, y_pred, y_true):
         """
-        Calculate the loss between predicted and true values.
+        Calculate the reward for each sequence.
 
         Args:
-            y_pred (Tensor): Predicted values.
-            y_true (Tensor): True values.
+            y_pred (Tensor): Predicted sequences.
+            y_true (Tensor): True sequences.
 
         Returns:
-            Tensor: Loss value.
+            List[int]: reward values.
         """
-        loss_fn = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-        return loss_fn(y_pred, y_true)
+        # print(y_pred)
+        # print(y_true)
+        rewards = edit_distance(y_pred,y_true, self.special_symbols)
+        # print(rewards)
+        return rewards
+        
+    def criterion(self, logprobs, rewards):
+        """
+        logprobs: (batch_size * sample_freq,)
+        rewards: (batch_size * sample_freq,)
+        Returns: scalar loss
+        """
+        k = self.config.sample_freq
+        total_samples = rewards.shape[0]
+        assert total_samples % k == 0, "Mismatch between total samples and sample_freq"
+        B = total_samples // k
+
+        logprobs = logprobs.view(B, k)  # (B, k)
+        rewards = rewards.view(B, k)    # (B, k)
+
+        # Leave-one-out baseline: average of other k-1 rewards per row
+        reward_sums = rewards.sum(dim=1, keepdim=True)           # (B, 1)
+        baseline = (reward_sums - rewards) / (k - 1)             # (B, k)
+
+        # Advantage
+        advantage = rewards - baseline                           # (B, k)
+
+        # REINFORCE loss: -advantage * logprob
+        loss = -advantage * logprobs                             # (B, k)
+
+        # Final scalar loss: mean over all examples
+        # print(loss)
+        # print(loss.mean())
+
+        return loss.mean(), advantage.detach()
+
 
     def _prepare_model(self):
         """
@@ -236,14 +274,11 @@ class Trainer():
                                                    pin_memory=self.config.pin_memory, collate_fn=collate_fn)
 
         dataloaders = {
-            'train': train_loader,
-            'valid': torch.utils.data.DataLoader(datasets['valid'],
-                                                 batch_size=self.config.valid_batch_size, shuffle=self.config.valid_shuffle,
-                                                 num_workers=self.config.num_workers, pin_memory=self.config.pin_memory, collate_fn=collate_fn),
-        }
+            'train': train_loader}
+        
         return dataloaders,datasets['valid']
-
-    def load_model(self, resume=False, epoch=None, lr=None):
+    
+    def load_model(self, resume=False, epoch=None, lr=None, initialize=False):
         """
         Load the most recent model checkpoint.
 
@@ -251,39 +286,48 @@ class Trainer():
             resume (bool, optional): Whether to resume training. Defaults to False.
             epoch (int, optional): Load model from a particular epoch
         """
-        checkpoint_name = f"{self.config.model_name}_best.pth" if resume else f"{self.config.model_name}_ep{epoch}.pth"
-        file = os.path.join(self.root_dir, checkpoint_name)
+        if initialize:
+            print("INITIALIZED MODEL FOR FINETUNING from: ", self.config.root_dir)
+            checkpoint_name = f"{self.config.model_name}_best.pth" if not epoch else f"{self.config.model_name}_ep{epoch}.pth"
+            file = os.path.join(self.root_dir, checkpoint_name)
+            device_name = f"cuda:{self.device}"
+            state = torch.load(file, map_location=device_name)
+            self.model.load_state_dict(state['state_dict'])
 
-        device_name = f"cuda:{self.device}"
-        state = torch.load(file, map_location=device_name)
-        self.model.load_state_dict(state['state_dict'])
-        
-        if resume or (epoch is not None):
-            self.train_loss_list = state['train_loss_list']
-            self.valid_loss_list = state['valid_loss_list']
-            self.best_val_loss = np.array(self.valid_loss_list).min()
-            self.optimizer.load_state_dict(state['optimizer'])
-            
-            if state['decay_scheduler'] is not None:
-                self.lr_scheduler.load_state_dict(state['decay_scheduler'])
-            if state['warm_scheduler'] is not None:
-                self.warm_scheduler.load_state_dict(state['warm_scheduler'])
-            
-            if 'scaler' in state:
-                self.scaler.load_state_dict(state['scaler'])
-            
-            self.global_step = state['global_step']
+        else:
+            checkpoint_name = f"{self.config.model_name}_best.pth" if resume else f"{self.config.model_name}_ep{epoch}.pth"
+            file = os.path.join(self.finetune_dir, checkpoint_name)
 
-            if epoch == None:
-                self.current_epoch = state['epoch']
+            device_name = f"cuda:{self.device}"
+            state = torch.load(file, map_location=device_name)
+            self.model.load_state_dict(state['state_dict'])
             
-            if lr:
-                for g in self.optimizer.param_groups:
-                    g['lr'] = lr
-                print("Lr_changed :)")
+            if resume or (epoch is not None):
+                self.train_loss_list = state['train_loss_list']
+                self.test_acc_list = state['test_acc_list']
+                self.best_acc = np.array(self.test_acc_list).max()
+                self.optimizer.load_state_dict(state['optimizer'])
+                
+                if state['decay_scheduler'] is not None:
+                    self.lr_scheduler.load_state_dict(state['decay_scheduler'])
+                if state['warm_scheduler'] is not None:
+                    self.warm_scheduler.load_state_dict(state['warm_scheduler'])
+                
+                if 'scaler' in state:
+                    self.scaler.load_state_dict(state['scaler'])
+                
+                self.global_step = state['global_step']
 
-            print(checkpoint_name)
-            print("Loaded :)")
+                if epoch == None:
+                    self.current_epoch = state['epoch']
+                
+                if lr:
+                    for g in self.optimizer.param_groups:
+                        g['lr'] = lr
+                    print("Lr_changed :)")
+
+                print(checkpoint_name)
+                print("Loaded :)")
 
     def _train_epoch(self):
         """
@@ -292,7 +336,6 @@ class Trainer():
         Returns:
             float: Average training loss for the epoch.
         """
-        self.ddp_model.train()
         pbar = tqdm(
             self.dataloaders['train'],
             total=len(self.dataloaders['train']),
@@ -304,31 +347,78 @@ class Trainer():
         total_samples = 0
 
         for src, tgt in pbar:
+
+            self.ddp_model.eval()
             src = src.to(self.device)
             tgt = tgt.to(self.device)
             batch_size = src.size(0)
+            src_padding_mask = (src != PAD_IDX)
+            sample_freq = self.config.sample_freq
+
+            start_symbols = tgt[:, 0].reshape(-1, 1).repeat_interleave(sample_freq, dim=0)
+            src = src.repeat_interleave(sample_freq, dim=0)
+            src_padding_mask = src_padding_mask.repeat_interleave(sample_freq, dim=0)
+
+            # print(src.shape, tgt.shape, src_padding_mask.shape, start_symbols.shape)
+            
+            decoded = greedy_decode(
+                self.ddp_model.module, self.device, self.config.tgt_max_len, src, 
+                src_padding_mask, start_symbols=start_symbols, dtype=self.dtype, 
+                temperature=self.config.temperature
+            )
+
+            tgt = tgt.detach().cpu().repeat_interleave(self.config.sample_freq, dim=0)
+            rewards = self._get_rewards(decoded.detach().cpu(), tgt)
+
+            self.ddp_model.train()
 
             with torch.autocast(device_type='cuda', dtype=self.dtype):
-                src_padding_mask, tgt_padding_mask = create_mask(
-                    src, tgt[:, :-1]
-                )
+
+                decoded_input = decoded[:, :-1]
+                decoded_target = decoded[:, 1:]
+
+                tgt_padding_mask = (decoded_input != PAD_IDX)
 
                 logits = self.ddp_model(
-                    src, tgt[:, :-1],
+                    src, decoded_input,
                     src_padding_mask, tgt_padding_mask,
                     src_padding_mask
                 )
 
-                loss = self.criterion(
-                    logits.reshape(-1, logits.shape[-1]),
-                    tgt[:, 1:].reshape(-1)
-                )
+                logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
 
+                logprobs = logprobs.gather(
+                    dim=2,
+                    index=decoded_target.unsqueeze(-1)
+                ).squeeze(-1)  # shape: [batch*k, seq_len]
+
+                logprobs = logprobs * tgt_padding_mask # mask out padding tokens
+                # print(logprobs)
+                # logprobs = logprobs.sum(dim=1) # shape: [batch*k]
+                seq_lens = tgt_padding_mask.sum(dim=1)  # number of non-padding tokens per sequence
+                logprobs = logprobs.sum(dim=1) / seq_lens.clamp(min=1)
+
+                # print(logprobs)
+                rewards_tensor = torch.tensor(rewards, dtype=self.dtype, device=self.device)
+
+
+                loss, advantage = self.criterion(logprobs, rewards_tensor)
+            
             if (self.global_step % self.config.log_freq == 0):
-                self.run.log({'train/loss': loss.item(), 'global_step': self.global_step})
+                self.run.log({
+                    'train/loss': loss.item(),
+                    'train/advantage_std': advantage.std().item(),
+                    'train/advantage_mean_sq': (advantage**2).mean().item(),
+                    'train/advantage_hist': wandb.Histogram(advantage.cpu().float().numpy()),
 
-            running_loss += loss.item() * batch_size
-            total_samples += batch_size
+                    'train/logprob_mean': logprobs.mean().item(),
+                    'train/logprob_hist': wandb.Histogram(logprobs.detach().cpu().float().numpy()),
+
+                    'global_step': self.global_step
+                })
+
+            running_loss += loss.item() * (batch_size * self.config.sample_freq)
+            total_samples += batch_size * self.config.sample_freq
             avg_loss = running_loss / total_samples
             pbar.set_postfix(loss=avg_loss)
 
@@ -345,7 +435,7 @@ class Trainer():
             self.scaler.step(self.optimizer)
             
             # Limit the grad scaler
-            MAX_SCALE = 1e35
+            MAX_SCALE = 1e30
             current_scale = self.scaler.get_scale()
             if current_scale > MAX_SCALE:
                 self.scaler.update(new_scale=MAX_SCALE)
@@ -382,53 +472,6 @@ class Trainer():
         return avg_loss
 
 
-    def evaluate(self):
-        """
-        Evaluate the model on the validation set.
-
-        Returns:
-            float: Average validation loss.
-        """
-        self.ddp_model.eval()
-        pbar = tqdm(
-            self.dataloaders["valid"],
-            total=len(self.dataloaders["valid"]),
-            disable=not self.is_master
-        )
-        pbar.set_description(f"[{self.current_epoch + 1}/{self.config.epochs}] Valid")
-
-        running_loss = 0.0
-        total_samples = 0
-
-        with torch.no_grad():
-            with torch.autocast(device_type='cuda', dtype=self.dtype):
-                for src, tgt in pbar:
-                    src = src.to(self.device)
-                    tgt = tgt.to(self.device)
-                    batch_size = src.size(0)
-
-                    src_padding_mask, tgt_padding_mask = create_mask(
-                        src, tgt[:, :-1]
-                    )
-
-                    logits = self.ddp_model(
-                        src, tgt[:, :-1],
-                        src_padding_mask, tgt_padding_mask,
-                        src_padding_mask
-                    )
-
-                    loss = self.criterion(
-                        logits.reshape(-1, logits.shape[-1]),
-                        tgt[:, 1:].reshape(-1)
-                    )
-
-                    running_loss += loss.item() * batch_size
-                    total_samples += batch_size
-                    avg_loss = running_loss / total_samples
-
-        return avg_loss
-
-
     def _save_model(self, checkpoint_name):
         """
         Save the model checkpoint.
@@ -436,7 +479,7 @@ class Trainer():
         Args:
             checkpoint_name (str): Name of the checkpoint file.
         """
-        ckp_path = os.path.join(self.root_dir, checkpoint_name)
+        ckp_path = os.path.join(self.finetune_dir, checkpoint_name)
         state_dict = self.ddp_model.module.state_dict()
 
         torch.save({
@@ -447,7 +490,7 @@ class Trainer():
             "warm_scheduler": self.warm_scheduler.state_dict() if self.warm_scheduler else None,
             "scaler": self.scaler.state_dict(),            
             "train_loss_list": self.train_loss_list,
-            "valid_loss_list": self.valid_loss_list,         
+            "test_acc_list": self.test_acc_list,         
             "global_step": self.global_step
         }, ckp_path)
 
@@ -479,6 +522,8 @@ class Trainer():
         })
         print(f"Test Accuracy: {round(test_accuracy_seq, 4)}")
 
+        return test_accuracy_seq
+
 
     def fit(self):
         """
@@ -489,46 +534,49 @@ class Trainer():
         self.run.define_metric("validation/*", step_metric="global_step")
         self.run.define_metric("train/*", step_metric="global_step")
         self.run.define_metric("test/*", step_metric="global_step")
-
+        
         if self.current_epoch != 0:
             self.load_model(epoch=self.current_epoch, lr=self.lr)
         elif self.resume_best:
             self.load_model(resume=True, lr=self.lr)
+        else:
+            self.load_model(initialize=True)
 
         for self.current_epoch in range(self.current_epoch, self.config.epochs):
             training_loss = self._train_epoch()
-            valid_loss = self.evaluate()
-
-            # if self.global_step >= self.warmup_steps and not self.is_constant_lr:
-            #     self.lr_scheduler.step(self.current_epoch)
-
+            # valid_loss = self.evaluate()
             
-            self.run.log({
-                'valid/loss': valid_loss,
-                'global_step': self.global_step
-            })
+            # self.run.log({
+            #     'valid/loss': valid_loss,
+            #     'global_step': self.global_step
+            # })
 
             self.train_loss_list.append(training_loss)
-            self.valid_loss_list.append(valid_loss)
+            # self.valid_loss_list.append(valid_loss)
 
             if self.is_master:
-                if valid_loss <= self.best_val_loss:
-                    self.best_val_loss = valid_loss
-                    self._save_model(f"{self.config.model_name}_best.pth")
 
                 if self.save_freq and (self.current_epoch + 1) % self.save_freq == 0:
                     self._save_model(f"{self.config.model_name}_ep{self.current_epoch + 1}.pth")
                     self._test_seq_acc(load_best=False, epochs=self.current_epoch)
 
                 elif (self.current_epoch + 1) % self.test_freq == 0:
-                    self._test_seq_acc()
+                    if self.current_epoch == 0:
+                        self._save_model(f"{self.config.model_name}_ep{self.current_epoch + 1}.pth")
+                        test_acc = self._test_seq_acc(load_best=False, epochs=self.current_epoch)
+                    else:
+                        test_acc = self._test_seq_acc()
+
+                    if test_acc >= self.best_acc:
+                        self.best_acc = test_acc
+                        self._save_model(f"{self.config.model_name}_best.pth")
+                    
 
             torch.distributed.barrier()
 
             print(
                 f"Epoch {self.current_epoch + 1}/{self.config.epochs}, "
                 f"Training Loss: {training_loss:.4f}, "
-                f"Validation Loss: {valid_loss:.4f}"
             )
 
         if self.is_master:

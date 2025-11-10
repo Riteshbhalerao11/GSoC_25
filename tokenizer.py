@@ -227,8 +227,11 @@ class Vocab:
         if include_special_tokens:
             return [self.idx_to_token.get(idx, self.unk_tok) for idx in indices]
         else:
-            return [self.idx_to_token.get(idx, self.unk_tok) for idx in indices if idx not in self.special_indices]
-
+            return [
+                self.idx_to_token.get(idx, self.unk_tok)
+                for idx in indices
+                if idx not in self.special_indices or idx == self.sep_idx]
+        
     def __len__(self):
         return len(self.token_list)
 

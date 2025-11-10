@@ -74,7 +74,7 @@ class KANFeedForwardBlock(nn.Module):
                 output_dim=d,
                 grid_size=grid_size,
                 device=device,
-                is_first=(i == 0)
+                is_first=False,
             ))
             in_size = d
 

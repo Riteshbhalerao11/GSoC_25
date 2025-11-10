@@ -14,7 +14,10 @@ from .fn_utils import (
     parse_args
 )
 from .trainer import Trainer
+from .finetune import SCSTrainer
 from .logger import get_logger
+
+
 
 
 
@@ -28,9 +31,32 @@ def main(config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab):
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # torch.use_deterministic_algorithms(True)
 
-    trainer = Trainer(config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab)
-    trainer.fit()
+    if config.finetune:
+        logger.info("Starting fine-tuning...")
+
+        if config.temperature <=0:
+            logger.warning("Temperature is set to 0 or negative, using default value of 1.3")
+            config.temperature = 1.3
+        
+        finetune_dir = os.path.join(config.root_dir, "finetune")
+        
+        inc_idxs = np.load(os.path.join(finetune_dir, "inc_idx.npy"))
+        sample_size = int(inc_idxs.shape[0] * 0.5)
+        corr_idxs = [i for i in range(len(df_train)) if i not in inc_idxs]
+        corr_sample = np.array(random.sample(corr_idxs, sample_size))
+        merged_idxs = np.concatenate([inc_idxs, corr_sample])
+        df_train = df_train.iloc[merged_idxs].reset_index(drop=True)
+        logger.info(f"Fine-tuning on {len(df_train)} samples")
+        # print(df_train.shape)
+        trainer = SCSTrainer(config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab, finetune_dir)
+        trainer.fit()
+
+    else:
+        
+        trainer = Trainer(config, df_train, df_valid, tokenizer, src_vocab, tgt_vocab)
+        trainer.fit()
 
 logger = get_logger(__name__) 
 
@@ -57,6 +83,7 @@ if __name__ == '__main__':
     if config.debug:
         config.epochs = 1
         df_train = df_train.sample(1000).reset_index(drop=True)
+        df_valid = df_valid.sample(100).reset_index(drop=True)
 
     logger.info(f"TRAIN SAMPLES: {df_train.shape}")
     logger.info("Data loading complete")
